@@ -1,0 +1,2989 @@
+// ==UserScript==
+// @name         Netflix Helper Pro+
+// @namespace    http://tampermonkey.net/
+// @version      15.1.0
+// @description  🎬 Netflix Cinema & Power-User Suite: Cinema Mode, IMDb/MAL modal ratings, secret genre browser, subtitle replay & live transcript, anti-spoiler blur, per-series profiles, dark-scene gamma, A-B loop & 4K diagnostics.
+// @match        https://*.netflix.com/*
+// @match        https://netflix.com/*
+// @run-at       document-start
+// @noframes
+// @grant        unsafeWindow
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      api.tvmaze.com
+// @connect      api.jikan.moe
+// @license      MIT
+// @author       Wabbit
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=netflix.com
+// @downloadURL  https://update.greasyfork.org/scripts/567750/Netflix%20Helper%20Pro%2B.user.js
+// @updateURL    https://update.greasyfork.org/scripts/567750/Netflix%20Helper%20Pro%2B.meta.js
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const VERSION = '15.1.0';
+
+    /* ─────────────────────────────────────────────────────────────
+       PAGE WINDOW
+       `@grant unsafeWindow` is REQUIRED: as soon as any other @grant is
+       present the script runs sandboxed, and without this grant the page's
+       `netflix` object is invisible — which breaks player API seeking.
+    ───────────────────────────────────────────────────────────── */
+    const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const log = (...a) => console.log('[NF+]', ...a);
+    const warn = (...a) => console.warn('[NF+]', ...a);
+
+    const CFG = {
+        tick: 1000, // stats / timers
+        skipPoll: 400, // auto-skip & A-B loop poll
+        ambiTick: 125, // 8 fps reactive Ambilight sampling
+        netWindow: 8000, // rolling throughput window
+        dimDelay: 2600, // panel fades this long after the mouse leaves
+        errorRecovery: 12000, // auto-skip pause after a playback error
+        seekStep: 10,
+        bigSeek: 30,
+        watchFlush: 15000
+    };
+
+    /* ─────────────────────────────────────────────────────────────
+       SETTINGS (cached in memory — the skip engine polls them often)
+    ───────────────────────────────────────────────────────────── */
+    const DEFAULTS = {
+        cinemaMode: false,
+        cinemaLights: true,
+        cinemaAmbi: false,
+        cinemaSubs: true,
+        cinemaSound: true,
+        speed: 1,
+        zoom: 100,
+        filters: { brightness: 100, contrast: 100, saturation: 100, gamma: 100, temp: 0, sharpness: 0 },
+        subs: { size: 100, lift: 0, bg: false, hidden: false },
+        audioMode: 'off',
+        boost: 100,
+        autoIntro: false,
+        autoNext: false,
+        autoCredits: false,
+        autoContinue: false,
+        muteBrowse: false,
+        antiSpoiler: false,
+        modalRatings: true,
+        browseLauncher: true,
+        subCopy: false,
+        maxBitrate: false,
+        sideSeek: false,
+        panelOpen: true,
+        minimized: false,
+        pos: null,
+        sections: {},
+        showProfiles: {},
+        watchLog: {},
+        skipStats: { count: 0, sec: 0 }
+    };
+    const DEFAULT_OPEN = { cinema: true, stats: true, playback: true };
+
+    const clone = v => (v && typeof v === 'object') ? JSON.parse(JSON.stringify(v)) : v;
+
+    const Store = {
+        get(key, def) {
+            try {
+                if (typeof GM_getValue === 'function') return GM_getValue(key, def);
+                const raw = localStorage.getItem('nfp_' + key);
+                return raw === null ? def : JSON.parse(raw);
+            } catch { return def; }
+        },
+        set(key, val) {
+            try {
+                if (typeof GM_setValue === 'function') GM_setValue(key, val);
+                else localStorage.setItem('nfp_' + key, JSON.stringify(val));
+            } catch { /* ignore */ }
+        }
+    };
+
+    const S = {
+        _c: Object.create(null),
+        get(k) {
+            if (!(k in this._c)) this._c[k] = clone(Store.get(k, DEFAULTS[k]));
+            return this._c[k];
+        },
+        set(k, v) { this._c[k] = v; Store.set(k, v); }
+    };
+
+    /* ─────────────────────────────────────────────────────────────
+       SMALL HELPERS
+    ───────────────────────────────────────────────────────────── */
+    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    const pad = n => String(n).padStart(2, '0');
+    const isWatchPage = () => /\/watch\//.test(location.pathname);
+    const videoIdFromUrl = () => (location.pathname.match(/\/watch\/(\d+)/) || [])[1] || '';
+    const dayKey = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+    const fmtDur = sec => {
+        sec = Math.max(0, Math.round(sec));
+        const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+        if (h) return `${h}h ${pad(m)}m`;
+        if (m) return `${m}m ${pad(s)}s`;
+        return `${s}s`;
+    };
+    const fmtClock = sec => {
+        sec = Math.max(0, Math.round(sec));
+        const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+        return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+    };
+    const fmtWallTime = secAhead => {
+        const d = new Date(Date.now() + Math.max(0, secAhead) * 1000);
+        return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+
+    // Trusted Types: if Netflix enforces it, plain innerHTML would throw.
+    const policy = (() => {
+        const tt = win.trustedTypes;
+        if (!tt || !tt.createPolicy) return null;
+        for (const name of ['nfp', 'nfp-' + Math.random().toString(36).slice(2, 6)]) {
+            try { return tt.createPolicy(name, { createHTML: s => s }); } catch { /* try next */ }
+        }
+        return null;
+    })();
+    const setHTML = (el, html) => { el.innerHTML = policy ? policy.createHTML(html) : html; };
+
+    /* ─────────────────────────────────────────────────────────────
+       CAPABILITY DIAGNOSTICS (Read-only MSE & Display checks)
+    ───────────────────────────────────────────────────────────── */
+    const Caps = (() => {
+        let cached = null;
+        const mse = c => {
+            try { return typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported(c); }
+            catch { return false; }
+        };
+        return {
+            probe() {
+                if (cached) return cached;
+                const dpr = window.devicePixelRatio || 1;
+                const sw = Math.round((screen.width || 0) * dpr);
+                const sh = Math.round((screen.height || 0) * dpr);
+                const hevc = mse('video/mp4; codecs="hev1.1.6.L120.90"') || mse('video/mp4; codecs="hvc1.1.6.L120.90"');
+                const av1 = mse('video/mp4; codecs="av01.0.08M.08"') || mse('video/mp4; codecs="av01.0.08M.10.0.110.09.16.09.0"');
+                const vp9 = mse('video/webm; codecs="vp09.02.10.10"') || mse('video/webm; codecs="vp9"');
+                const hdr = !!(window.matchMedia && window.matchMedia('(dynamic-range: high)').matches);
+                cached = { sw, sh, isUhdPanel: sw >= 3840 || sh >= 2160, hevc, av1, vp9, hdr };
+                return cached;
+            }
+        };
+    })();
+
+    /* ─────────────────────────────────────────────────────────────
+       DOM HELPERS
+    ───────────────────────────────────────────────────────────── */
+    const DOM = {
+        video() {
+            return document.querySelector('[data-uia="video-canvas"] video, .watch-video video, video');
+        },
+        title() {
+            const el = document.querySelector('[data-uia="video-title"]');
+            return (el && el.textContent && el.textContent.trim()) || 'Now Screening';
+        },
+        seriesName() {
+            const h4 = document.querySelector('[data-uia="video-title"] h4');
+            if (h4 && h4.textContent.trim()) return h4.textContent.trim();
+            const raw = this.title();
+            if (raw === 'Now Screening') return '';
+            return raw.replace(/\s+[SE]\d+:?E?\d+.*$/i, '').trim();
+        },
+        visible(el) {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) return false;
+            const s = getComputedStyle(el);
+            return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0;
+        },
+        firstVisible(selectors) {
+            for (const sel of selectors) {
+                try {
+                    const el = document.querySelector(sel);
+                    if (el && this.visible(el)) return el;
+                } catch { /* bad selector */ }
+            }
+            return null;
+        },
+        fsRoot() { return document.fullscreenElement || document.webkitFullscreenElement || null; },
+        host() {
+            const r = this.fsRoot();
+            if (!r || r === document.documentElement || r === document.body) return document.body;
+            if (r.tagName === 'VIDEO') return r.parentElement || document.body;
+            return r;
+        }
+    };
+
+    /* ─────────────────────────────────────────────────────────────
+       NETFLIX PLAYER API
+       Seeking through video.currentTime triggers error M7375, so all
+       seeking goes through Netflix's own player object.
+    ───────────────────────────────────────────────────────────── */
+    const NFPlayer = {
+        _p: null,
+        _id: null,
+
+        _vp() {
+            try { return win.netflix?.appContext?.state?.playerApp?.getAPI?.()?.videoPlayer || null; }
+            catch { return null; }
+        },
+
+        get() {
+            const vp = this._vp();
+            if (!vp) { this._p = null; this._id = null; return null; }
+            let ids;
+            try { ids = vp.getAllPlayerSessionIds?.() || []; } catch { return null; }
+            if (!ids.length) { this._p = null; this._id = null; return null; }
+            if (this._p && ids.includes(this._id)) return this._p;
+            for (const id of ids) {
+                try {
+                    const p = vp.getVideoPlayerBySessionId(id);
+                    if (p && p.getDuration?.() > 0) { this._p = p; this._id = id; return p; }
+                } catch { /* try next */ }
+            }
+            try {
+                const p = vp.getVideoPlayerBySessionId(ids[0]);
+                this._p = p; this._id = ids[0];
+                return p;
+            } catch { return null; }
+        },
+
+        reset() { this._p = null; this._id = null; },
+
+        call(fn, fallback) {
+            const p = this.get();
+            if (!p) return fallback;
+            try { return fn(p); } catch { this._p = null; return fallback; }
+        },
+
+        seekTo(seconds) {
+            return this.call(p => {
+                const dur = p.getDuration();
+                p.seek(clamp(seconds * 1000, 0, dur));
+                return true;
+            }, false);
+        },
+
+        seekBy(seconds) {
+            return this.call(p => {
+                const cur = p.getCurrentTime(), dur = p.getDuration();
+                p.seek(clamp(cur + seconds * 1000, 0, dur));
+                return true;
+            }, false);
+        },
+        currentTime() { return this.call(p => p.getCurrentTime() / 1000, 0); },
+        duration() { return this.call(p => p.getDuration() / 1000, 0); },
+        pause() { return this.call(p => { p.pause(); return true; }, false); },
+        audioTracks() { return this.call(p => p.getAudioTrackList?.() || [], []); },
+        currentAudio() { return this.call(p => p.getAudioTrack?.() || null, null); },
+        setAudio(track) { return this.call(p => { p.setAudioTrack?.(track); return true; }, false); },
+        textTracks() { return this.call(p => p.getTimedTextTrackList?.() || [], []); },
+        currentText() { return this.call(p => p.getTimedTextTrack?.() || null, null); },
+        setText(track) { return this.call(p => { p.setTimedTextTrack?.(track); return true; }, false); },
+        lockMaxBitrate() {
+            return this.call(p => {
+                const list = p.getVideoBitrateList?.() || p.getElement?.()?.getVideoBitrateList?.();
+                if (!Array.isArray(list) || !list.length) return null;
+                const max = Math.max(...list.map(x => (typeof x === 'number' ? x : (x.bitrate || 0))));
+                if (max <= 0) return null;
+                if (typeof p.setVideoBitrateRange === 'function') {
+                    p.setVideoBitrateRange(max, max);
+                    return max;
+                }
+                return null;
+            }, null);
+        }
+    };
+
+    /* ─────────────────────────────────────────────────────────────
+       NETWORK TRACKER
+    ───────────────────────────────────────────────────────────── */
+    class NetTracker {
+        constructor() {
+            this.events = [];
+            this.history = [];
+            this.sawEntry = false;
+            this.sawSize = false;
+            this.t0 = performance.now();
+            this._obs = null;
+            this._start();
+        }
+
+        _start() {
+            if (typeof PerformanceObserver === 'undefined') return;
+            try {
+                this._obs = new PerformanceObserver(list => {
+                    const now = performance.now();
+                    for (const e of list.getEntries()) {
+                        if (e.initiatorType !== 'fetch' && e.initiatorType !== 'xmlhttprequest') continue;
+                        if (!/nflxvideo\.net|nflxso\.net/i.test(e.name)) continue;
+                        this.sawEntry = true;
+                        const bytes = e.transferSize || e.encodedBodySize || 0;
+                        if (bytes > 0) { this.sawSize = true; this.events.push({ t: now, bytes }); }
+                    }
+                });
+                this._obs.observe({ type: 'resource', buffered: false });
+            } catch (e) { warn('PerformanceObserver unavailable:', e); }
+        }
+
+        get blocked() { return this.sawEntry && !this.sawSize; }
+
+        rate(windowMs = CFG.netWindow) {
+            const now = performance.now();
+            const cut = now - windowMs;
+            while (this.events.length && this.events[0].t < cut) this.events.shift();
+            if (!this.events.length) return 0;
+            const span = Math.min(windowMs, Math.max(1000, now - this.t0)) / 1000;
+            const bytes = this.events.reduce((a, e) => a + e.bytes, 0);
+            return span > 0 ? (bytes * 8) / span / 1e6 : 0;
+        }
+
+        sample() {
+            const m = this.rate();
+            if (m > 0) {
+                this.history.push(m);
+                if (this.history.length > 300) this.history.shift();
+            }
+            return m;
+        }
+
+        avg() {
+            return this.history.length ? this.history.reduce((a, b) => a + b, 0) / this.history.length : 0;
+        }
+
+        reset() { this.events = []; this.history = []; this.t0 = performance.now(); }
+
+        destroy() {
+            if (this._obs) { try { this._obs.disconnect(); } catch { /* ignore */ } this._obs = null; }
+        }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       FPS METER (Runs ONLY while Live Stats is open & visible)
+    ───────────────────────────────────────────────────────────── */
+    class FpsMeter {
+        constructor() {
+            this.fps = 0;
+            this._v = null;
+            this._id = 0;
+            this._active = false;
+            this._lastMedia = 0;
+            this._lastFrames = 0;
+        }
+
+        sync(video, shouldRun) {
+            if (!shouldRun || !video || typeof video.requestVideoFrameCallback !== 'function') {
+                this.stop();
+                return;
+            }
+            if (this._active && this._v === video) return;
+            this.stop();
+            this._v = video;
+            this._active = true;
+            this._lastMedia = 0;
+            this._lastFrames = 0;
+
+            const step = (now, meta) => {
+                if (!this._active || this._v !== video || now < 0) return;
+                if (this._lastFrames > 0) {
+                    const df = meta.presentedFrames - this._lastFrames;
+                    const dm = meta.mediaTime - this._lastMedia;
+                    if (dm >= 0.5 && df > 0 && dm < 5) {
+                        const est = df / dm;
+                        if (est > 5 && est < 140) this.fps = est;
+                        this._lastMedia = meta.mediaTime;
+                        this._lastFrames = meta.presentedFrames;
+                    } else if (dm < 0 || dm >= 5) {
+                        this._lastMedia = meta.mediaTime;
+                        this._lastFrames = meta.presentedFrames;
+                    }
+                } else {
+                    this._lastMedia = meta.mediaTime;
+                    this._lastFrames = meta.presentedFrames;
+                }
+                this._id = video.requestVideoFrameCallback(step);
+            };
+            this._id = video.requestVideoFrameCallback(step);
+        }
+
+        stop() {
+            if (this._v && this._id && typeof this._v.cancelVideoFrameCallback === 'function') {
+                try { this._v.cancelVideoFrameCallback(this._id); } catch { /* ignore */ }
+            }
+            this._active = false;
+            this._v = null;
+            this._id = 0;
+            this.fps = 0;
+        }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       REACTIVE AMBILIGHT & BIAS HALO ENGINE
+       - Paints a blurred ambient projection glow behind the video.
+       - Automatically detects if hardware DRM blanks canvas readback and
+         falls back to zero-CPU warm cinema D65 bias lighting.
+    ───────────────────────────────────────────────────────────── */
+    class AmbiEngine {
+        constructor() {
+            this.canvas = null;
+            this.ctx = null;
+            this._timer = 0;
+            this._drmBlocked = false;
+            this._darkHits = 0;
+            this._v = null;
+        }
+
+        _ensureCanvas(video) {
+            const parent = video.parentElement;
+            if (!parent) return false;
+            if (!this.canvas) {
+                const c = document.createElement('canvas');
+                c.className = 'nfp-ambi';
+                c.width = 32;
+                c.height = 18;
+                this.canvas = c;
+                this.ctx = c.getContext('2d', { willReadFrequently: true });
+            }
+            if (this.canvas.parentElement !== parent) {
+                parent.insertBefore(this.canvas, video);
+            }
+            return true;
+        }
+
+        _paintBiasGlow() {
+            if (!this.ctx) return;
+            const g = this.ctx.createRadialGradient(16, 9, 2, 16, 9, 18);
+            g.addColorStop(0, 'rgba(255, 198, 135, 0.55)');
+            g.addColorStop(0.6, 'rgba(180, 120, 75, 0.32)');
+            g.addColorStop(1, 'rgba(20, 14, 10, 0)');
+            this.ctx.clearRect(0, 0, 32, 18);
+            this.ctx.fillStyle = g;
+            this.ctx.fillRect(0, 0, 32, 18);
+        }
+
+        sync(enabled, video) {
+            if (!enabled || !video || !isWatchPage()) {
+                this.stop();
+                return;
+            }
+            if (this._v !== video) {
+                this._v = video;
+                this._drmBlocked = false;
+                this._darkHits = 0;
+            }
+            if (!this._ensureCanvas(video)) return;
+            if (this._timer) return;
+
+            this._paintBiasGlow();
+            this._timer = setInterval(() => this._step(), CFG.ambiTick);
+        }
+
+        _step() {
+            const v = this._v;
+            if (!v || !v.isConnected || !this.ctx) { this.stop(); return; }
+            if (this._drmBlocked || v.paused || v.readyState < 2 || !v.videoWidth) return;
+
+            try {
+                this.ctx.drawImage(v, 0, 0, 32, 18);
+                if (this._darkHits < 8) {
+                    const d = this.ctx.getImageData(4, 4, 24, 10).data;
+                    let lit = false;
+                    for (let i = 0; i < d.length; i += 16) {
+                        if (d[i] > 10 || d[i + 1] > 10 || d[i + 2] > 10) { lit = true; break; }
+                    }
+                    if (!lit && v.currentTime > 2) {
+                        this._darkHits++;
+                        if (this._darkHits >= 6) {
+                            this._drmBlocked = true;
+                            this._paintBiasGlow();
+                        }
+                    } else if (lit) {
+                        this._darkHits = 10; // Confirmed readable: never call getImageData again
+                    }
+                }
+            } catch {
+                this._drmBlocked = true;
+                this._paintBiasGlow();
+            }
+        }
+
+        stop() {
+            if (this._timer) { clearInterval(this._timer); this._timer = 0; }
+            if (this.canvas) { this.canvas.remove(); }
+            this._v = null;
+        }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       SECRET GENRES, SUBTITLE REPLAY/LOG & MODAL RATINGS
+    ───────────────────────────────────────────────────────────── */
+    const HIDDEN_GENRES = [
+        ['Anime (All)', 7424], ['Action Anime', 2653], ['Anime Sci-Fi', 2729], ['Anime Fantasy', 11146],
+        ['Anime Series', 6721], ['Adult Animation', 11881], ['Martial Arts', 8985], ['Action Thrillers', 43048],
+        ['Sci-Fi & Cyber', 1492], ['Mind-Bending Thrillers', 8933], ['Psychological Horror', 5505],
+        ['Cult Horror', 10944], ['Spy Action', 10702], ['Crime Documentaries', 9875], ['Historical Epics', 52858],
+        ['Gangster Movies', 31851], ['Dark Comedies', 869], ['Korean TV & Film', 67879], ['Cult Movies', 7627],
+        ['Classic Cinema', 31574]
+    ];
+
+    const netGetJson = url => new Promise(resolve => {
+        if (typeof GM_xmlhttpRequest === 'function') {
+            try {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    timeout: 6000,
+                    onload: r => {
+                        try { resolve(r.status >= 200 && r.status < 300 ? JSON.parse(r.responseText) : null); }
+                        catch { resolve(null); }
+                    },
+                    onerror: () => resolve(null),
+                    ontimeout: () => resolve(null)
+                });
+                return;
+            } catch { /* fallback to fetch */ }
+        }
+        fetch(url).then(r => (r.ok ? r.json() : null)).then(resolve).catch(() => resolve(null));
+    });
+
+    class SubTracker {
+        constructor(ui) {
+            this.ui = ui;
+            this.lines = [];
+            this.lastText = '';
+            this._mo = null;
+            this._deb = 0;
+        }
+
+        start() {
+            this.stop();
+            if (!document.body) return;
+            this._mo = new MutationObserver(() => {
+                if (!isWatchPage() || this._deb) return;
+                this._deb = setTimeout(() => { this._deb = 0; this._scan(); }, 90);
+            });
+            this._mo.observe(document.body, { childList: true, subtree: true, characterData: true });
+        }
+
+        stop() {
+            if (this._mo) { this._mo.disconnect(); this._mo = null; }
+            if (this._deb) { clearTimeout(this._deb); this._deb = 0; }
+        }
+
+        reset() {
+            this.lines = [];
+            this.lastText = '';
+            this.ui._renderSubLog();
+        }
+
+        currentText() {
+            const nodes = document.querySelectorAll('.watch-video .player-timedtext-text-container');
+            if (!nodes.length) return '';
+            const parts = [];
+            nodes.forEach(n => {
+                const t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+                if (t) parts.push(t);
+            });
+            return parts.join(' ');
+        }
+
+        _scan() {
+            const txt = this.currentText();
+            if (!txt || txt === this.lastText) {
+                if (!txt) this.lastText = '';
+                return;
+            }
+            this.lastText = txt;
+            const cur = NFPlayer.currentTime() || (DOM.video()?.currentTime ?? 0);
+            const t = Math.max(0, cur - 0.15);
+            const prev = this.lines[this.lines.length - 1];
+            if (!prev || prev.text !== txt) {
+                this.lines.push({ t, text: txt });
+                if (this.lines.length > 35) this.lines.shift();
+                this.ui._renderSubLog();
+            }
+            if (S.get('subCopy') && navigator.clipboard) {
+                navigator.clipboard.writeText(txt).catch(() => {});
+            }
+        }
+
+        replay() {
+            if (!this.lines.length) return null;
+            const now = NFPlayer.currentTime() || 0;
+            let idx = this.lines.length - 1;
+            if (idx > 0 && now - this.lines[idx].t < 1.3) idx--;
+            const item = this.lines[idx];
+            NFPlayer.seekTo(item.t);
+            return item;
+        }
+    }
+
+    class BrowseEnhancer {
+        constructor() {
+            this.cache = new Map();
+            this._lastModal = null;
+            this._lastTitle = '';
+        }
+
+        _norm(s) { return (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+
+        _modalTitle(modal) {
+            const logo = modal.querySelector('[data-uia="previewModal--player-titleTreatment-logo"][alt], .previewModal--boxart[alt]');
+            if (logo) {
+                const a = logo.getAttribute('alt');
+                if (a && a.trim()) return a.trim();
+            }
+            const strong = modal.querySelector('.about-header strong');
+            if (strong && strong.textContent.trim()) return strong.textContent.trim();
+            return '';
+        }
+
+        async _lookup(title) {
+            if (this.cache.has(title)) return this.cache.get(title);
+            const p = (async () => {
+                const q = encodeURIComponent(title);
+                const [tv, mal] = await Promise.all([
+                    netGetJson(`https://api.tvmaze.com/singlesearch/shows?q=${q}`),
+                    netGetJson(`https://api.jikan.moe/v4/anime?q=${q}&limit=1`)
+                ]);
+                const out = { tvmaze: null, imdbId: '', malScore: null, malUrl: '' };
+                const want = this._norm(title);
+                if (tv && tv.name && this._norm(tv.name) === want) {
+                    if (tv.rating && tv.rating.average) out.tvmaze = tv.rating.average;
+                    if (tv.externals && tv.externals.imdb) out.imdbId = tv.externals.imdb;
+                }
+                const a = mal && mal.data && mal.data[0];
+                if (a && a.score) {
+                    const m1 = this._norm(a.title), m2 = this._norm(a.title_english);
+                    if (m1 === want || m2 === want || (want.length >= 6 && (m1.startsWith(want) || m2.startsWith(want)))) {
+                        out.malScore = a.score;
+                        out.malUrl = a.url || '';
+                    }
+                }
+                return out;
+            })();
+            this.cache.set(title, p);
+            return p;
+        }
+
+        tick() {
+            if (!S.get('modalRatings') || isWatchPage()) return;
+            const modal = document.querySelector('[data-uia="previewModal--container"], .previewModal--wrapper');
+            if (!modal) { this._lastModal = null; this._lastTitle = ''; return; }
+            const title = this._modalTitle(modal);
+            if (!title) return;
+            const host = modal.querySelector('.previewModal--detailsMetadata-left, .previewModal--info');
+            if (!host || host.querySelector('.nfp-ratebar')) return;
+            if (this._lastModal === modal && this._lastTitle === title) return;
+            this._lastModal = modal;
+            this._lastTitle = title;
+
+            const bar = document.createElement('div');
+            bar.className = 'nfp-ratebar';
+            const q = encodeURIComponent(title);
+            const mkLink = (cls, label, href) => `<a class="nfp-rpill ${cls}" href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+            setHTML(bar, [
+                mkLink('imdb', '⭐ IMDb ↗', `https://www.imdb.com/find/?q=${q}`),
+                mkLink('rt', '🍅 Rotten Tomatoes ↗', `https://www.rottentomatoes.com/search?search=${q}`),
+                mkLink('lb', '🎞️ Letterboxd ↗', `https://letterboxd.com/search/${q}/`),
+                mkLink('mal', '🌸 MAL ↗', `https://myanimelist.net/anime.php?q=${q}`)
+            ].join(''));
+            host.insertBefore(bar, host.firstChild);
+
+            this._lookup(title).then(info => {
+                if (!bar.isConnected || !info) return;
+                const imdbEl = bar.querySelector('.nfp-rpill.imdb');
+                if (imdbEl) {
+                    if (info.imdbId) imdbEl.href = `https://www.imdb.com/title/${info.imdbId}/`;
+                    if (info.tvmaze) imdbEl.textContent = `⭐ ${info.tvmaze} · IMDb ↗`;
+                }
+                const malEl = bar.querySelector('.nfp-rpill.mal');
+                if (malEl && info.malScore) {
+                    malEl.textContent = `🌸 ${Number(info.malScore).toFixed(2)} MAL ↗`;
+                    if (info.malUrl) malEl.href = info.malUrl;
+                    malEl.classList.add('hit');
+                }
+            });
+        }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       WATCH-TIME TRACKER
+    ───────────────────────────────────────────────────────────── */
+    class WatchTracker {
+        constructor() {
+            this.log = S.get('watchLog');
+            this.last = 0;
+            this.session = 0;
+            this.dirty = false;
+            this.lastFlush = Date.now();
+            this._prune();
+        }
+
+        _prune() {
+            const keys = Object.keys(this.log).sort();
+            while (keys.length > 120) delete this.log[keys.shift()];
+        }
+
+        tick(playing) {
+            const now = Date.now();
+            const dt = this.last ? Math.min((now - this.last) / 1000, 2.5) : 0;
+            this.last = now;
+            if (!playing || dt <= 0) return;
+            const k = dayKey();
+            this.log[k] = (this.log[k] || 0) + dt;
+            this.session += dt;
+            this.dirty = true;
+            if (now - this.lastFlush > CFG.watchFlush) this.flush();
+        }
+
+        flush() {
+            if (!this.dirty) return;
+            S.set('watchLog', this.log);
+            this.dirty = false;
+            this.lastFlush = Date.now();
+        }
+
+        today() { return this.log[dayKey()] || 0; }
+
+        days(n) {
+            let sum = 0;
+            const d = new Date();
+            for (let i = 0; i < n; i++) {
+                sum += this.log[dayKey(d)] || 0;
+                d.setDate(d.getDate() - 1);
+            }
+            return sum;
+        }
+
+        total() { return Object.values(this.log).reduce((a, b) => a + b, 0); }
+
+        reset() { this.log = {}; this.session = 0; this.dirty = false; S.set('watchLog', this.log); }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       AUDIO ENGINE (3D Theater Convolver + Haas Soundstage + EQ + Boost)
+       - Never attaches Web Audio while boost === 100% AND mode === 'off',
+         preserving untouched multichannel passthrough until needed.
+    ───────────────────────────────────────────────────────────── */
+    const AUDIO_PRESETS = {
+        off: { hp: 12, midGain: 0, lowGain: 0, thr: -3, knee: 6, ratio: 12, makeup: 1.00, rev: 0, haas: 0 },
+        theater: { hp: 28, midGain: 2.2, lowGain: 4.2, thr: -10, knee: 10, ratio: 6, makeup: 1.12, rev: 0.22, haas: 0.16 },
+        voice: { hp: 95, midGain: 5.0, lowGain: -2.5, thr: -18, knee: 12, ratio: 4, makeup: 1.25, rev: 0, haas: 0 },
+        night: { hp: 80, midGain: 3.0, lowGain: -4.0, thr: -28, knee: 15, ratio: 8, makeup: 1.65, rev: 0, haas: 0 },
+        cinema: { hp: 20, midGain: 1.5, lowGain: 4.5, thr: -8, knee: 8, ratio: 8, makeup: 1.05, rev: 0.08, haas: 0.08 }
+    };
+
+    class AudioEngine {
+        constructor() {
+            this.ctx = null;
+            this.impulse = null;
+            this.nodes = new WeakMap();
+            this.pct = 100;
+            this.mode = 'off';
+        }
+
+        _ctx() {
+            if (this.ctx) return this.ctx;
+            const AC = window.AudioContext || window.webkitAudioContext;
+            if (!AC) return null;
+            try { this.ctx = new AC(); } catch { return null; }
+            return this.ctx;
+        }
+
+        // Synthesize a velvet-damped auditorium impulse response (20ms pre-delay, 0.42s RT60)
+        _hallImpulse(ctx) {
+            if (this.impulse) return this.impulse;
+            const rate = ctx.sampleRate;
+            const len = Math.floor(rate * 0.42);
+            const pre = Math.floor(rate * 0.02);
+            const buf = ctx.createBuffer(2, len, rate);
+            for (let ch = 0; ch < 2; ch++) {
+                const d = buf.getChannelData(ch);
+                let prev = 0;
+                for (let i = pre; i < len; i++) {
+                    const p = (i - pre) / (len - pre);
+                    const decay = Math.pow(1 - p, 2.8);
+                    const white = Math.random() * 2 - 1;
+                    prev = prev * 0.64 + white * 0.36; // 1-pole HF absorption like cinema seats
+                    d[i] = prev * decay * 0.48;
+                }
+            }
+            this.impulse = buf;
+            return buf;
+        }
+
+        _connect(video) {
+            try {
+                const ctx = this.ctx;
+                const src = ctx.createMediaElementSource(video);
+                const hp = ctx.createBiquadFilter();
+                const mid = ctx.createBiquadFilter();
+                const low = ctx.createBiquadFilter();
+                const dryGain = ctx.createGain();
+                const comp = ctx.createDynamicsCompressor();
+
+                hp.type = 'highpass'; hp.Q.value = 0.7;
+                mid.type = 'peaking'; mid.frequency.value = 2500; mid.Q.value = 0.95;
+                low.type = 'lowshelf'; low.frequency.value = 85;
+                comp.attack.value = 0.004;
+                comp.release.value = 0.25;
+
+                // Spatial theater room & Haas early-reflection network
+                const wetHp = ctx.createBiquadFilter();
+                wetHp.type = 'highpass'; wetHp.frequency.value = 160;
+                const wetLp = ctx.createBiquadFilter();
+                wetLp.type = 'lowpass'; wetLp.frequency.value = 3400;
+
+                const conv = ctx.createConvolver();
+                conv.buffer = this._hallImpulse(ctx);
+                const revGain = ctx.createGain();
+                revGain.gain.value = 0;
+
+                const split = ctx.createChannelSplitter(2);
+                const merge = ctx.createChannelMerger(2);
+                const dL = ctx.createDelay(0.05); dL.delayTime.value = 0.013;
+                const dR = ctx.createDelay(0.05); dR.delayTime.value = 0.019;
+                const haasGain = ctx.createGain();
+                haasGain.gain.value = 0;
+
+                // Dry path (phase-coherent phantom center)
+                src.connect(hp);
+                hp.connect(mid);
+                mid.connect(low);
+                low.connect(dryGain);
+                dryGain.connect(comp);
+
+                // Wet spatial path (160Hz-3.4kHz warm room reflections)
+                low.connect(wetHp);
+                wetHp.connect(wetLp);
+                wetLp.connect(conv);
+                conv.connect(revGain);
+                revGain.connect(comp);
+
+                wetLp.connect(split);
+                split.connect(dL, 0);
+                split.connect(dR, 1);
+                dL.connect(merge, 0, 1);
+                dR.connect(merge, 0, 0);
+                merge.connect(haasGain);
+                haasGain.connect(comp);
+
+                comp.connect(ctx.destination);
+
+                const n = { hp, mid, low, dryGain, revGain, haasGain, comp };
+                this.nodes.set(video, n);
+                return n;
+            } catch (e) { warn('AudioEngine could not attach:', e); return null; }
+        }
+
+        async apply(pct, mode, video) {
+            this.pct = pct;
+            this.mode = AUDIO_PRESETS[mode] ? mode : 'off';
+            if (!video) return true;
+
+            let n = this.nodes.get(video);
+            if (!n) {
+                if (pct <= 100 && this.mode === 'off') return true;
+                const ctx = this._ctx();
+                if (!ctx) return false;
+                if (ctx.state !== 'running') { try { await ctx.resume(); } catch { /* needs gesture */ } }
+                if (ctx.state !== 'running') return 'pending';
+                n = this._connect(video);
+                if (!n) return false;
+            } else if (this.ctx && this.ctx.state === 'suspended') {
+                this.ctx.resume().catch(() => {});
+            }
+
+            const p = AUDIO_PRESETS[this.mode];
+            const t = this.ctx.currentTime;
+            const scale = this.pct / 100;
+            n.hp.frequency.setTargetAtTime(p.hp, t, 0.03);
+            n.mid.gain.setTargetAtTime(p.midGain, t, 0.03);
+            n.low.gain.setTargetAtTime(p.lowGain, t, 0.03);
+            n.comp.threshold.setTargetAtTime(p.thr, t, 0.03);
+            n.comp.knee.setTargetAtTime(p.knee, t, 0.03);
+            n.comp.ratio.setTargetAtTime(p.ratio, t, 0.03);
+            n.dryGain.gain.setTargetAtTime(scale * p.makeup, t, 0.03);
+            n.revGain.gain.setTargetAtTime(scale * p.rev, t, 0.04);
+            n.haasGain.gain.setTargetAtTime(scale * p.haas, t, 0.04);
+            return true;
+        }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       SLEEP TIMER
+    ───────────────────────────────────────────────────────────── */
+    class SleepTimer {
+        constructor(ui) {
+            this.ui = ui;
+            this.mode = null;
+            this.choice = '0';
+            this.endAt = 0;
+        }
+
+        set(val) {
+            val = String(val);
+            if (val === 'end') {
+                this.mode = 'end';
+                this.choice = 'end';
+                this.endAt = 0;
+                return;
+            }
+            const m = parseInt(val, 10);
+            if (m > 0) {
+                this.mode = 'min';
+                this.choice = String(m);
+                this.endAt = Date.now() + m * 60000;
+            } else {
+                this.mode = null;
+                this.choice = '0';
+                this.endAt = 0;
+            }
+        }
+
+        _timeLeft(v) {
+            const d = NFPlayer.duration(), c = NFPlayer.currentTime();
+            if (d > 0) return d - c;
+            return isFinite(v.duration) ? v.duration - v.currentTime : Infinity;
+        }
+
+        tick(v) {
+            if (!this.mode || !v) return;
+            if (this.mode === 'min' && Date.now() >= this.endAt) {
+                this._fire('⏰ Sleep timer — paused');
+            } else if (this.mode === 'end' && !v.paused) {
+                if (this._timeLeft(v) <= 1.2 + 1.5 * v.playbackRate) this._fire('😴 End of episode — paused');
+            }
+        }
+
+        label() {
+            if (this.mode === 'min') return `Pausing in ${fmtClock((this.endAt - Date.now()) / 1000)}`;
+            if (this.mode === 'end') return 'Pausing at end of episode';
+            return 'Off';
+        }
+
+        _fire(msg) {
+            this.mode = null;
+            this.choice = '0';
+            this.endAt = 0;
+            this.ui.pauseVideo();
+            this.ui.toast(msg, 'sleep');
+            this.ui._syncSleepUI();
+        }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       AUTO-SKIP & A-B LOOP ENGINE
+    ───────────────────────────────────────────────────────────── */
+    const SEL = {
+        intro: ['[data-uia="player-skip-intro"]', "[aria-label='Skip Intro']", '.skip-intro button', '.PlayerControls--skip-intro'],
+        recap: ['[data-uia="player-skip-recap"]', "[aria-label='Skip Recap']", '.skip-recap button'],
+        next: [
+            '[data-uia="next-episode-seamless-button"]',
+            '[data-uia="next-episode-seamless-button-draining"]',
+            '[data-uia="next-episode-button"]',
+            '.skip-credits > a',
+            "[aria-label='Watch Episode']"
+        ],
+        credits: ['[data-uia="watch-credits-seamless-button"]', "[aria-label='Watch Credits']"],
+        cont: ['[data-uia="interrupt-autoplay-continue"]', "[aria-label='Continue Playing']"]
+    };
+
+    class AutoSkipEngine {
+        constructor(ui) {
+            this.ui = ui;
+            this.cool = Object.create(null);
+            this.until = 0;
+            this._poll = null;
+            this._mo = null;
+            this._deb = 0;
+            this._loopCool = 0;
+        }
+
+        suspend(ms) { this.until = Math.max(this.until, Date.now() + ms); }
+        newEpisode() { this.cool = Object.create(null); }
+
+        start() {
+            this.stop();
+            this._poll = setInterval(() => this._check(), CFG.skipPoll);
+            if (document.body) {
+                this._mo = new MutationObserver(() => {
+                    if (this._deb) return;
+                    this._deb = setTimeout(() => { this._deb = 0; this._check(); }, 120);
+                });
+                this._mo.observe(document.body, { childList: true, subtree: true });
+            }
+        }
+
+        stop() {
+            if (this._poll) { clearInterval(this._poll); this._poll = null; }
+            if (this._mo) { this._mo.disconnect(); this._mo = null; }
+            if (this._deb) { clearTimeout(this._deb); this._deb = 0; }
+        }
+
+        _checkLoop() {
+            const ab = this.ui.ab;
+            if (ab.a === null || ab.b === null || ab.b <= ab.a + 1) return;
+            const now = Date.now();
+            if (now - this._loopCool < 1000) return;
+            const cur = NFPlayer.currentTime();
+            if (cur >= ab.b) {
+                this._loopCool = now;
+                NFPlayer.seekTo(ab.a);
+            }
+        }
+
+        _check() {
+            if (!isWatchPage()) return;
+            this._checkLoop();
+            if (Date.now() < this.until) return;
+
+            const intro = S.get('autoIntro');
+            const next = S.get('autoNext') && this.ui.sleep.mode !== 'end';
+            const credits = !next && (S.get('autoCredits') || S.get('cinemaMode'));
+            const cont = S.get('autoContinue');
+            if (!intro && !next && !credits && !cont) return;
+
+            if (intro && !this._try('intro', SEL.intro, 3000, true)) {
+                this._try('recap', SEL.recap, 3000, true);
+            }
+            if (next) this._try('next', SEL.next, 10000, false);
+            if (credits) this._try('credits', SEL.credits, 8000, false);
+            if (cont) this._try('cont', SEL.cont, 10000, false);
+        }
+
+        _try(kind, selectors, cooldown, measure) {
+            const now = Date.now();
+            if (now - (this.cool[kind] || 0) < cooldown) return false;
+            const btn = DOM.firstVisible(selectors);
+            if (!btn) return false;
+            this.cool[kind] = now;
+            const t0 = measure ? NFPlayer.currentTime() : 0;
+            log('AutoSkip:', kind);
+            setTimeout(() => {
+                try { btn.click(); } catch { /* ignore */ }
+                if (measure) this.ui.recordSkip(t0);
+            }, 150);
+            return true;
+        }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       UI
+    ───────────────────────────────────────────────────────────── */
+    class UI {
+        constructor() {
+            this.panel = null;
+            this.launcher = null;
+            this.toasts = null;
+            this.lights = null;
+
+            this.net = new NetTracker();
+            this.fps = new FpsMeter();
+            this.ambi = new AmbiEngine();
+            this.subTracker = new SubTracker(this);
+            this.browse = new BrowseEnhancer();
+            this.watch = new WatchTracker();
+            this.audio = new AudioEngine();
+            this.sleep = new SleepTimer(this);
+            this.skip = new AutoSkipEngine(this);
+            this.ab = { a: null, b: null };
+            this._loadedSeries = '';
+
+            const savedFilters = S.get('filters') || {};
+            if (savedFilters.gamma === undefined && savedFilters.sharpness > 0 && savedFilters.sharpness <= 3) {
+                savedFilters.sharpness = savedFilters.sharpness * 25;
+            }
+            this.filters = Object.assign({}, DEFAULTS.filters, savedFilters);
+            this.subs = Object.assign({}, DEFAULTS.subs, S.get('subs'));
+
+            this.presets = {
+                'Default': { brightness: 100, contrast: 100, saturation: 100, gamma: 100, temp: 0, sharpness: 0 },
+                'Silver Screen (35mm)': { brightness: 99, contrast: 110, saturation: 108, gamma: 108, temp: 10, sharpness: 18 },
+                'Dark Scene Lift': { brightness: 100, contrast: 106, saturation: 105, gamma: 128, temp: 0, sharpness: 15 },
+                'Cinema': { brightness: 98, contrast: 112, saturation: 112, gamma: 105, temp: 12, sharpness: 20 },
+                'Sharp & Clear': { brightness: 100, contrast: 108, saturation: 106, gamma: 106, temp: 0, sharpness: 55 },
+                'Vibrant': { brightness: 103, contrast: 115, saturation: 128, gamma: 105, temp: 5, sharpness: 30 },
+                'Warm Night': { brightness: 95, contrast: 104, saturation: 108, gamma: 115, temp: 32, sharpness: 0 },
+                'Cool Crisp': { brightness: 100, contrast: 108, saturation: 98, gamma: 100, temp: -25, sharpness: 25 }
+            };
+
+            this.open = !!S.get('panelOpen');
+            this._force = false;
+            this._wasWatch = null;
+            this._dead = false;
+            this._listeners = [];
+            this._vlisteners = [];
+            this._intervals = [];
+            this._video = null;
+            this._first = true;
+            this._seeking = false;
+            this._wantPip = false;
+            this._epId = '';
+            this._syncing = false;
+            this._toastMap = new Map();
+            this._menuIds = [];
+            this._gestureArmed = { pip: false, audio: false };
+            this._dimT = 0;
+            this._pauseT = 0;
+            this._fApplied = new WeakMap();
+            this._zApplied = new WeakMap();
+            this._svgSig = '';
+            this._autoMuted = new WeakSet();
+        }
+
+        $(id) { return this.panel ? this.panel.querySelector('#' + id) : null; }
+
+        _on(t, type, fn, opt) {
+            if (!t) return;
+            t.addEventListener(type, fn, opt);
+            this._listeners.push({ t, type, fn, opt });
+        }
+        _onV(t, type, fn) {
+            t.addEventListener(type, fn);
+            this._vlisteners.push({ t, type, fn });
+        }
+        _clearV() {
+            this._vlisteners.forEach(({ t, type, fn }) => t.removeEventListener(type, fn));
+            this._vlisteners = [];
+        }
+        _iv(fn, ms) {
+            const id = setInterval(fn, ms);
+            this._intervals.push(id);
+            return id;
+        }
+
+        destroy() {
+            this._dead = true;
+            try { this.watch.flush(); } catch { /* ignore */ }
+            this.fps.stop();
+            this.ambi.stop();
+            this.subTracker.stop();
+            this.skip.stop();
+            this.net.destroy();
+            clearTimeout(this._dimT);
+            clearTimeout(this._pauseT);
+            this._intervals.forEach(clearInterval);
+            this._listeners.forEach(({ t, type, fn, opt }) => { try { t.removeEventListener(type, fn, opt); } catch { /* ignore */ } });
+            this._clearV();
+            [this.panel, this.launcher, this.toasts, this.lights].forEach(el => { if (el) el.remove(); });
+            ['nfp-style', 'nfp-subs-style', 'nfp-spoiler-style', 'nfp-svg'].forEach(id => { const el = document.getElementById(id); if (el) el.remove(); });
+            if (typeof GM_unregisterMenuCommand === 'function') {
+                this._menuIds.forEach(id => { try { GM_unregisterMenuCommand(id); } catch { /* ignore */ } });
+            }
+        }
+
+        /* ───────── styles ───────── */
+        _css() {
+            const old = document.getElementById('nfp-style');
+            if (old) old.remove();
+            const s = document.createElement('style');
+            s.id = 'nfp-style';
+            s.textContent = `
+            .nfp, .nfp * { box-sizing: border-box; }
+            .nfp [hidden] { display: none !important; }
+            .nfp {
+                position: fixed; top: 20px; right: 20px; width: 356px; max-width: calc(100vw - 16px);
+                max-height: 88vh; display: flex; flex-direction: column;
+                background: rgba(14,14,14,.97);
+                color: #ececec; font: 13px/1.35 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                border-radius: 14px; z-index: 2147483645; overflow: hidden; user-select: none;
+                box-shadow: 0 12px 40px rgba(0,0,0,.65), 0 0 0 1px rgba(229,9,20,.28);
+                opacity: 1; transition: opacity .3s;
+                contain: layout paint style;
+            }
+            .nfp.dim { opacity: .24; }
+            .nfp.cinema-vanish.dim { opacity: 0; }
+            .nfp:hover, .nfp.dim:hover, .nfp.cinema-vanish.dim:hover { opacity: 1; }
+            .nfp.min .nfp-body { display: none; }
+
+            .nfp-hd {
+                display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+                padding: 11px 12px 11px 14px; cursor: grab; touch-action: none;
+                background: linear-gradient(90deg, #e50914, #a30610); font-weight: 700; font-size: 14px;
+            }
+            .nfp-hd.drag { cursor: grabbing; }
+            .nfp-hdl { display: flex; align-items: center; gap: 8px; }
+            .nfp-badge { background: rgba(255,255,255,.22); padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 600; }
+            .nfp-btns { display: flex; gap: 6px; }
+            .nfp-cb {
+                width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; padding: 0;
+                background: rgba(255,255,255,.2); border: 0; border-radius: 6px; color: #fff; font-size: 14px; cursor: pointer;
+            }
+            .nfp-cb:hover { background: rgba(255,255,255,.38); }
+
+            .nfp-hero {
+                margin: 10px 0 4px; padding: 11px 12px; border-radius: 11px;
+                background: linear-gradient(135deg, rgba(229,9,20,.18), rgba(212,155,55,.14));
+                border: 1px solid rgba(212,155,55,.35);
+                display: flex; align-items: center; justify-content: space-between; gap: 10px;
+            }
+            .nfp-hero.on {
+                background: linear-gradient(135deg, rgba(229,9,20,.34), rgba(212,155,55,.28));
+                border-color: rgba(255,196,92,.7);
+            }
+            .nfp-hero-t { font-weight: 700; font-size: 13px; color: #fff3db; }
+            .nfp-hero-s { font-size: 10.5px; color: #d1bfa0; margin-top: 2px; }
+            .nfp-hero-btn {
+                padding: 7px 13px; border-radius: 20px; border: 1px solid rgba(255,205,112,.55);
+                background: rgba(0,0,0,.35); color: #ffd996; font-weight: 700; font-size: 11.5px; cursor: pointer; white-space: nowrap;
+            }
+            .nfp-hero.on .nfp-hero-btn { background: #e5a00d; border-color: #ffd996; color: #111; }
+
+            .nfp-body { padding: 4px 14px 12px; overflow-y: auto; flex-grow: 1; }
+            .nfp-body::-webkit-scrollbar { width: 5px; }
+            .nfp-body::-webkit-scrollbar-thumb { background: #e50914; border-radius: 3px; }
+
+            .nfp-sec { border-bottom: 1px solid rgba(255,255,255,.07); }
+            .nfp-sec summary {
+                list-style: none; cursor: pointer; padding: 10px 0; font-weight: 600; color: #cfcfcf;
+                display: flex; align-items: center; justify-content: space-between;
+            }
+            .nfp-sec summary::-webkit-details-marker { display: none; }
+            .nfp-sec summary::after { content: '▸'; color: #777; transition: transform .15s; }
+            .nfp-sec[open] summary::after { transform: rotate(90deg); }
+            .nfp-sec summary:hover { color: #fff; }
+            .nfp-sb { padding: 2px 0 13px; }
+
+            .nfp-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px 8px; background: rgba(255,255,255,.05); border-radius: 10px; padding: 10px; }
+            .nfp-stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+            .nfp-sl { font-size: 10px; color: #8a8a8a; }
+            .nfp-sv { font-size: 12.5px; font-weight: 700; color: #ff4b55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .nfp-note { font-size: 10.5px; color: #808080; margin: 8px 0 0; line-height: 1.45; }
+
+            .nfp-row { margin-bottom: 11px; }
+            .nfp-rh { display: flex; justify-content: space-between; margin-bottom: 5px; color: #c8c8c8; font-size: 12px; }
+            .nfp-val { color: #ff4b55; background: rgba(229,9,20,.14); padding: 1px 8px; border-radius: 10px; font-size: 11px; }
+            .nfp-range { -webkit-appearance: none; appearance: none; width: 100%; height: 4px; background: rgba(255,255,255,.14); border-radius: 4px; outline: none; margin: 5px 0; }
+            .nfp-range::-webkit-slider-thumb { -webkit-appearance: none; width: 15px; height: 15px; background: #e50914; border-radius: 50%; cursor: pointer; border: 2px solid #fff; }
+            .nfp-range::-moz-range-thumb { width: 12px; height: 12px; background: #e50914; border-radius: 50%; cursor: pointer; border: 2px solid #fff; }
+            .nfp-range:focus-visible { box-shadow: 0 0 0 2px rgba(255,255,255,.5); }
+
+            .nfp-chips, .nfp-btnrow { display: flex; gap: 6px; flex-wrap: wrap; margin: 7px 0; }
+            .nfp-chip { flex: 1; min-width: 44px; padding: 6px 5px; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.1); border-radius: 6px; color: #ddd; font-size: 11px; cursor: pointer; }
+            .nfp-chip:hover, .nfp-chip.active { background: #e50914; border-color: #e50914; color: #fff; }
+            .nfp-btn { flex: 1 1 45%; padding: 8px; background: rgba(229,9,20,.1); border: 1px solid rgba(229,9,20,.32); border-radius: 8px; color: #ff4b55; font-weight: 600; font-size: 12px; cursor: pointer; }
+            .nfp-btn:hover, .nfp-btn.active { background: #e50914; color: #fff; }
+            .nfp-btn.wide { flex-basis: 100%; }
+            .nfp-btn:focus-visible, .nfp-chip:focus-visible, .nfp-cb:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+
+            .nfp-sel { width: 100%; padding: 8px; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.12); border-radius: 8px; color: #fff; font-size: 12px; margin-bottom: 10px; cursor: pointer; }
+            .nfp-sel option { background: #1a1a1a; }
+
+            .nfp-checks { display: flex; flex-direction: column; gap: 9px; background: rgba(255,255,255,.05); border-radius: 10px; padding: 11px; }
+            .nfp-ck { position: relative; display: flex; align-items: center; gap: 9px; cursor: pointer; color: #ddd; font-size: 12px; }
+            .nfp-ck input { position: absolute; opacity: 0; pointer-events: none; }
+            .nfp-cm { width: 18px; height: 18px; min-width: 18px; background: rgba(255,255,255,.12); border-radius: 4px; position: relative; }
+            .nfp-ck:hover .nfp-cm { background: rgba(229,9,20,.35); }
+            .nfp-ck input:checked + .nfp-cm { background: #e50914; }
+            .nfp-ck input:checked + .nfp-cm::after { content: '✓'; position: absolute; color: #fff; font-size: 12px; top: 50%; left: 50%; transform: translate(-50%,-50%); }
+            .nfp-ck input:focus-visible + .nfp-cm { outline: 2px solid #fff; }
+
+            .nfp-pills { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 5px; }
+            .nfp-pill { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; padding: 3px 8px; border-radius: 10px; background: rgba(255,255,255,.07); color: #8a8a8a; }
+            .nfp-pill.on { background: rgba(229,9,20,.18); color: #ff8a8a; }
+            .nfp-pill.ok { background: rgba(34,197,94,.15); color: #7ee2a0; }
+            .nfp-dot { width: 6px; height: 6px; border-radius: 50%; background: #555; flex-shrink: 0; }
+            .nfp-pill.on .nfp-dot { background: #e50914; }
+            .nfp-pill.ok .nfp-dot { background: #22c55e; }
+
+            .nfp-list { display: flex; flex-direction: column; gap: 6px; background: rgba(255,255,255,.05); border-radius: 10px; padding: 10px; font-size: 12px; }
+            .nfp-li { display: flex; justify-content: space-between; gap: 10px; color: #9a9a9a; align-items: center; }
+            .nfp-li b { color: #f2f2f2; font-weight: 600; text-align: right; }
+            .nfp-key { background: #333; color: #fff; padding: 1px 6px; border-radius: 4px; font: 11px ui-monospace, Consolas, monospace; white-space: nowrap; }
+            .nfp-subhd { font-size: 11px; font-weight: 600; color: #9a9a9a; margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .04em; }
+
+            .nfp-ft { display: flex; justify-content: space-between; align-items: center; margin-top: 12px; font-size: 10.5px; color: #666; }
+            .nfp-link { background: none; border: 0; color: #888; font-size: 10.5px; cursor: pointer; text-decoration: underline; padding: 0; }
+            .nfp-link:hover { color: #fff; }
+
+            .nfp-launch {
+                position: fixed; top: 20px; right: 20px; width: 38px; height: 38px; border-radius: 50%; border: 0; padding: 0;
+                background: #e50914; color: #fff; font-size: 18px; cursor: pointer; z-index: 2147483645;
+                opacity: .35; transition: opacity .2s; box-shadow: 0 4px 16px rgba(0,0,0,.5);
+            }
+            .nfp-launch:hover, .nfp-launch:focus-visible { opacity: 1; }
+
+            /* Cinema Theater House Lights & Intermission Marquee */
+            .nfp-lights {
+                position: fixed; inset: 0; pointer-events: none; z-index: 2147483640;
+                box-shadow: inset 0 0 150px 42px rgba(255, 166, 72, 0.24), inset 0 0 40px 6px rgba(255, 190, 110, 0.12);
+                opacity: 0; transition: opacity 1.25s ease;
+            }
+            .nfp-lights.paused { opacity: 1; transition: opacity 0.85s ease; }
+            .nfp-marquee {
+                position: absolute; top: 26px; left: 32px; display: flex; align-items: center; gap: 10px;
+                padding: 8px 16px; border-radius: 30px;
+                background: rgba(18, 13, 8, 0.86); border: 1px solid rgba(255, 196, 107, 0.45);
+                color: #fce8c3; font: 600 12.5px/1.2 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                letter-spacing: .02em; box-shadow: 0 8px 28px rgba(0,0,0,.6);
+            }
+            .nfp-marquee span { color: #d4b483; font-weight: 500; }
+
+            /* Reactive Ambilight Projection Halo */
+            .nfp-ambi {
+                position: absolute; inset: -5%; width: 110%; height: 110%;
+                filter: blur(46px) saturate(165%); opacity: .68; pointer-events: none; z-index: 0;
+            }
+            video.nfp-screen-frame {
+                border-radius: 6px;
+                box-shadow: 0 20px 65px rgba(0,0,0,.88), 0 0 0 1px rgba(255,255,255,.06);
+                background: transparent !important;
+            }
+
+            /* Live Subtitle Dialogue Log & Genre Jumper */
+            .nfp-sublog {
+                max-height: 120px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
+                background: rgba(255,255,255,.04); border-radius: 8px; padding: 7px; margin-top: 8px; font-size: 11.5px;
+            }
+            .nfp-sublog::-webkit-scrollbar { width: 4px; }
+            .nfp-sublog::-webkit-scrollbar-thumb { background: #e50914; border-radius: 2px; }
+            .nfp-subitem {
+                display: flex; gap: 7px; align-items: baseline; text-align: left; width: 100%;
+                background: none; border: 0; color: #d5d5d5; padding: 3px 5px; border-radius: 5px; cursor: pointer; font: inherit;
+            }
+            .nfp-subitem:hover { background: rgba(229,9,20,.22); color: #fff; }
+            .nfp-subt { color: #ff6b73; font: 10.5px ui-monospace, Consolas, monospace; flex-shrink: 0; }
+            .nfp-inp {
+                flex: 1; min-width: 90px; padding: 6px 9px; border-radius: 6px;
+                border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.08); color: #fff; font-size: 12px;
+            }
+
+            /* Browse Modal IMDb / MAL / RT Rating Pills */
+            .nfp-ratebar { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 10px; align-items: center; }
+            .nfp-rpill {
+                display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 16px;
+                font: 600 12px/1.2 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                text-decoration: none !important; color: #f3f3f3 !important;
+                background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18); transition: background .15s;
+            }
+            .nfp-rpill:hover { background: rgba(229,9,20,.45); border-color: #ff6b73; }
+            .nfp-rpill.imdb { background: rgba(245,197,24,.18); border-color: rgba(245,197,24,.45); color: #ffe074 !important; }
+            .nfp-rpill.mal.hit { background: rgba(46,81,162,.35); border-color: rgba(120,160,255,.55); color: #cfe0ff !important; }
+
+            .nfp-toasts { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: none; z-index: 2147483646; }
+            .nfp-toast { padding: 8px 16px; background: rgba(0,0,0,.92); color: #fff; border: 1px solid #e50914; border-radius: 30px; font: 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; animation: nfp-fade 2.2s ease forwards; }
+            @keyframes nfp-fade { 0% { opacity: 0; transform: translateY(-8px); } 10% { opacity: 1; transform: none; } 80% { opacity: 1; } 100% { opacity: 0; transform: translateY(-8px); } }
+            @media (prefers-reduced-motion: reduce) { .nfp, .nfp-launch, .nfp-lights { transition: none; } .nfp-toast { animation-duration: 2.2s; } }
+            `;
+            document.head.appendChild(s);
+        }
+
+        /* ───────── markup ───────── */
+        _html() {
+            const sec = (id, title, body) =>
+                `<details class="nfp-sec" data-sec="${id}"><summary>${title}</summary><div class="nfp-sb">${body}</div></details>`;
+            const ck = (id, label) =>
+                `<label class="nfp-ck"><input type="checkbox" id="${id}"><span class="nfp-cm"></span><span>${label}</span></label>`;
+            const slider = (label, valId, id, min, max, step) =>
+                `<div class="nfp-row"><div class="nfp-rh"><span>${label}</span><span class="nfp-val" id="${valId}"></span></div>
+                 <input type="range" class="nfp-range" id="${id}" min="${min}" max="${max}" step="${step}"></div>`;
+            const stat = (label, id, tip) =>
+                `<div class="nfp-stat"><span class="nfp-sl"${tip ? ` title="${tip}"` : ''}>${label}</span><span class="nfp-sv" id="${id}">–</span></div>`;
+            const li = (label, id) => `<div class="nfp-li"><span>${label}</span><b id="${id}">–</b></div>`;
+            const key = (label, k) => `<div class="nfp-li"><span>${label}</span><span class="nfp-key">${k}</span></div>`;
+            const pill = id => `<span class="nfp-pill" id="${id}"><i class="nfp-dot"></i><span></span></span>`;
+
+            const c = Caps.probe();
+            const capBadge = (ok, txt) => `<span class="nfp-pill ${ok ? 'ok' : ''}"><i class="nfp-dot"></i><span>${txt}</span></span>`;
+            const capNote = c.hevc
+                ? 'Hardware HEVC detected — native 4K is supported if your Netflix plan, HDCP 2.2 display, and browser DRM allow it.'
+                : 'No hardware HEVC detected — Chrome/Opera/Firefox cap Netflix at 720p/1080p. For native 4K on a 4K plan, use Edge (Windows + HEVC extension) or Safari (macOS).';
+
+            const presetOpts = ['Custom', ...Object.keys(this.presets)].map(n => `<option>${n}</option>`).join('');
+            const audioOpts = [
+                ['off', 'Off (Untouched passthrough)'],
+                ['theater', '🏛️ 3D Cinema Hall (spatial auditorium)'],
+                ['voice', '🗣️ Dialogue Clarity (vocal boost)'],
+                ['night', '🌙 Night Mode (tame loud SFX)'],
+                ['cinema', '🎬 Cinema Bass (warm punch)']
+            ].map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+            const sleepOpts = [
+                ['0', 'Off'], ['15', '15 minutes'], ['30', '30 minutes'], ['45', '45 minutes'],
+                ['60', '1 hour'], ['90', '90 minutes'], ['end', 'End of episode']
+            ].map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+            const speedChips = [0.75, 1, 1.25, 1.5, 2]
+                .map(s => `<button type="button" class="nfp-chip" data-speed="${s}">${s}x</button>`).join('');
+            const zoomChips = [[100, '16:9 Fit'], [113, '2.00:1'], [134, '21:9 Scope']]
+                .map(([z, l]) => `<button type="button" class="nfp-chip" data-zoom="${z}">${l}</button>`).join('');
+            const genreChips = HIDDEN_GENRES
+                .map(([name, id]) => `<button type="button" class="nfp-chip" data-genre="${id}" style="flex:1 1 44%">${name}</button>`).join('');
+
+            this.panel = document.createElement('div');
+            this.panel.className = 'nfp';
+            setHTML(this.panel, `
+            <div class="nfp-hd" id="nfpHd" title="Drag to move · double-click to reset position">
+                <div class="nfp-hdl">🎬 <span>Netflix Pro+</span><span class="nfp-badge">v${VERSION}</span></div>
+                <div class="nfp-btns">
+                    <button type="button" class="nfp-cb" id="nfpMin" title="Minimise">−</button>
+                    <button type="button" class="nfp-cb" id="nfpX" title="Hide (F2 or the 🎬 button brings it back)">✕</button>
+                </div>
+            </div>
+            <div class="nfp-body">
+                <div class="nfp-hero" id="nfpHero">
+                    <div>
+                        <div class="nfp-hero-t">🍿 Theater Cinema Mode</div>
+                        <div class="nfp-hero-s">3D hall sound · house lights · silver-warm subs</div>
+                    </div>
+                    <button type="button" class="nfp-hero-btn" id="nfpCinemaBtn" title="Shortcut: G">Enter</button>
+                </div>
+
+                ${sec('cinema', '🏛️ Cinema experience', `
+                    <div class="nfp-checks">
+                        ${ck('nfpCLights', 'Theater house lights (warm intermission glow on pause)')}
+                        ${ck('nfpCSound', 'Auto-enable 3D Cinema Hall spatial acoustics')}
+                        ${ck('nfpCSubs', 'Silver-warm cinema subtitles (no harsh white glare)')}
+                        ${ck('nfpCAmbi', 'Floating projection screen + live Ambilight halo')}
+                    </div>
+                    <p class="nfp-note">Press <b>G</b> anytime during a show to toggle Cinema Mode. While active, this panel turns 100% invisible when idle and post-credit scenes never shrink.</p>`)}
+
+                ${sec('stats', '📊 Live stats &amp; 4K readiness', `
+                    <div class="nfp-grid">
+                        ${stat('Resolution', 'nfpRes')}
+                        ${stat('Frame rate', 'nfpFps', 'Measured via requestVideoFrameCallback')}
+                        ${stat('Network', 'nfpNet', 'Download rate over the last 8 seconds')}
+                        ${stat('Avg network', 'nfpAvg')}
+                        ${stat('Buffer', 'nfpBuf', 'Seconds buffered ahead of playhead')}
+                        ${stat('Dropped', 'nfpDr', 'Dropped / total decoded frames')}
+                        ${stat('Real left', 'nfpLeft', 'Remaining time adjusted for current playback speed')}
+                        ${stat('Finishes at', 'nfpEnd', 'Local clock time when this title finishes')}
+                        ${stat('Watched today', 'nfpToday')}
+                    </div>
+                    <div class="nfp-pills">
+                        ${capBadge(c.hevc, `HEVC ${c.hevc ? '✓' : '✕'}`)}
+                        ${capBadge(c.av1, `AV1 ${c.av1 ? '✓' : '✕'}`)}
+                        ${capBadge(c.hdr, `HDR ${c.hdr ? '✓' : '✕'}`)}
+                        ${capBadge(c.isUhdPanel, `Display ${c.sw}×${c.sh}`)}
+                    </div>
+                    <p class="nfp-note">${capNote}</p>
+                    <p class="nfp-note" id="nfpNetNote" hidden>* Your browser hides cross-origin transfer sizes, so network Mbps can't be measured.</p>`)}
+
+                ${sec('playback', '🎮 Playback, Aspect Crop &amp; Loop', `
+                    ${slider('Speed', 'nfpSpV', 'nfpSp', 0.25, 3, 0.05)}
+                    <div class="nfp-chips">${speedChips}</div>
+                    ${slider('Cinema zoom / crop', 'nfpZmV', 'nfpZm', 100, 150, 1)}
+                    <div class="nfp-chips">
+                        ${zoomChips}
+                        <button type="button" class="nfp-chip" id="nfpAutoCrop" title="Detect encoded black letterbox bars">✨ Auto</button>
+                    </div>
+                    <div class="nfp-subhd">🔁 A–B Scene Loop (<span id="nfpAbSt">Off</span>)</div>
+                    <div class="nfp-chips">
+                        <button type="button" class="nfp-chip" id="nfpAbA">Set A</button>
+                        <button type="button" class="nfp-chip" id="nfpAbB">Set B</button>
+                        <button type="button" class="nfp-chip" id="nfpAbC">Clear</button>
+                    </div>
+                    <div class="nfp-subhd">📌 Per-Series Profile (<span id="nfpPinSt">Not saved</span>)</div>
+                    <div class="nfp-chips">
+                        <button type="button" class="nfp-chip" id="nfpPinSave">Save for this show</button>
+                        <button type="button" class="nfp-chip" id="nfpPinDel">Forget show</button>
+                    </div>
+                    <div class="nfp-btnrow">
+                        <button type="button" class="nfp-btn" id="nfpFs">⛶ Fullscreen</button>
+                        <button type="button" class="nfp-btn" id="nfpMt">🔇 Mute</button>
+                        <button type="button" class="nfp-btn" id="nfpPip">🖼️ Mini player</button>
+                        <button type="button" class="nfp-btn" id="nfpShot">📸 Screenshot</button>
+                    </div>`)}
+
+                ${sec('filters', '🎨 Picture &amp; Dark-Scene Enhancer', `
+                    <select class="nfp-sel" id="nfpPre">${presetOpts}</select>
+                    ${slider('Shadow lift (Gamma)', 'nfpGamV', 'nfpGam', 70, 150, 1)}
+                    ${slider('Detail sharpener', 'nfpShV', 'nfpSh', 0, 100, 5)}
+                    ${slider('Color temperature', 'nfpTmpV', 'nfpTmp', -50, 50, 1)}
+                    ${slider('Brightness', 'nfpBriV', 'nfpBri', 50, 150, 1)}
+                    ${slider('Contrast', 'nfpConV', 'nfpCon', 50, 150, 1)}
+                    ${slider('Saturation', 'nfpSatV', 'nfpSat', 50, 150, 1)}
+                    <button type="button" class="nfp-btn wide" id="nfpRF">↺ Reset picture</button>
+                    <p class="nfp-note">Shadow lift brightens dark scenes while keeping pure blacks black. At default values, all filters are removed from the video for zero GPU cost.</p>`)}
+
+                ${sec('audio', '🔊 Audio Enhancer &amp; Boost', `
+                    <select class="nfp-sel" id="nfpAudM">${audioOpts}</select>
+                    ${slider('Volume boost', 'nfpBoostV', 'nfpBoost', 100, 300, 10)}
+                    <p class="nfp-note">3D Cinema Hall uses synthesized auditorium reflections + Haas widening so headphones and speakers sound like a wide theater room while keeping voices centered.</p>`)}
+
+                ${sec('subs', '💬 Subtitles, Replay &amp; Dialogue Log', `
+                    ${slider('Subtitle size', 'nfpSubSV', 'nfpSubS', 70, 180, 5)}
+                    ${slider('Vertical lift (21:9 safe)', 'nfpSubLV', 'nfpSubL', 0, 25, 1)}
+                    <div class="nfp-btnrow">
+                        <button type="button" class="nfp-btn" id="nfpSubRep">⏪ Replay line (R)</button>
+                        <button type="button" class="nfp-btn" id="nfpSubCp">📋 Copy line (Shift+X)</button>
+                    </div>
+                    <div class="nfp-checks" style="margin-bottom:8px">
+                        ${ck('nfpSubBg', 'Readable dark backdrop behind text')}
+                        ${ck('nfpSubHid', 'Hide subtitles temporarily (Shift + C)')}
+                        ${ck('nfpSubAutoCp', 'Auto-copy every subtitle line to clipboard')}
+                    </div>
+                    <div class="nfp-subhd">Live Dialogue Log (click any line to seek)</div>
+                    <div class="nfp-sublog" id="nfpSubLog"><span class="nfp-note" style="margin:0">Subtitles will appear here while playing…</span></div>
+                    <button type="button" class="nfp-btn wide" id="nfpRS" style="margin-top:8px">↺ Reset subtitle style</button>`)}
+
+                ${sec('auto', '⚙️ Automation, Ratings &amp; Anti-Spoiler', `
+                    <div class="nfp-checks">
+                        ${ck('nfpAI', 'Skip intro &amp; recap')}
+                        ${ck('nfpAN', 'Play next episode automatically')}
+                        ${ck('nfpAWC', 'Auto-expand shrunk credits (when Next Episode is off)')}
+                        ${ck('nfpAC', 'Dismiss “Are you still watching?”')}
+                        ${ck('nfpMR', 'Show IMDb / MAL / RT ratings on title popups')}
+                        ${ck('nfpAS', 'Anti-spoiler (blur episode thumbnails &amp; synopses until hovered)')}
+                        ${ck('nfpMB', 'Mute home-page autoplay trailer previews')}
+                        ${ck('nfpBL', 'Show 🎬 launcher button on browse pages too')}
+                        ${ck('nfpSS', 'Double-click left / right side of video to seek ±10s')}
+                    </div>
+                    <div class="nfp-pills">${pill('nfpPillI')}${pill('nfpPillN')}${pill('nfpPillP')}</div>`)}
+
+                ${sec('genres', '🗂️ Secret Netflix categories', `
+                    <div class="nfp-chips" style="margin-top:2px">
+                        <input type="text" class="nfp-inp" id="nfpGenIn" placeholder="Genre ID (e.g. 7424)">
+                        <button type="button" class="nfp-chip" id="nfpGenGo" style="flex:0 0 64px">Open ↗</button>
+                    </div>
+                    <div class="nfp-chips">${genreChips}</div>
+                    <p class="nfp-note">Jumps straight to Netflix's hidden micro-genre pages (/browse/genre/ID).</p>`)}
+
+                ${sec('sleep', '😴 Sleep timer', `
+                    <select class="nfp-sel" id="nfpSleep">${sleepOpts}</select>
+                    <div class="nfp-li"><span>Status</span><b id="nfpSleepSt">Off</b></div>`)}
+
+                ${sec('history', '📈 Watch stats', `
+                    <div class="nfp-list">
+                        ${li('Today', 'nfpH1')}${li('Last 7 days', 'nfpH7')}${li('All logged', 'nfpHT')}
+                        ${li('This session', 'nfpHS')}${li('Intros / recaps skipped', 'nfpHK')}
+                    </div>
+                    <div class="nfp-ft"><span>Saved locally in your userscript manager</span><button type="button" class="nfp-link" id="nfpHR">Reset</button></div>`)}
+
+                ${sec('tools', '🎯 Stream, Tracks &amp; Diagnostics', `
+                    <div class="nfp-checks" style="margin-bottom:10px">
+                        ${ck('nfpMaxBr', 'Prefer highest offered bitrate (when player API exposes it)')}
+                    </div>
+                    <div class="nfp-subhd">Audio Track</div>
+                    <select class="nfp-sel" id="nfpAudTrk"><option value="">Play a title to list audio tracks…</option></select>
+                    <div class="nfp-subhd">Subtitle Track</div>
+                    <select class="nfp-sel" id="nfpTxtTrk"><option value="">Play a title to list subtitle tracks…</option></select>
+                    <div class="nfp-btnrow">
+                        <button type="button" class="nfp-btn" id="nfpTStats">Stats overlay</button>
+                        <button type="button" class="nfp-btn" id="nfpTSel">Stream selector</button>
+                    </div>
+                    <p class="nfp-note">Selects among bitrates and audio/subtitle tracks Netflix already offers to this session.</p>`)}
+
+                ${sec('keys', '⌨️ Shortcuts', `
+                    <div class="nfp-list">
+                        ${key('Show / hide panel', 'F2')}
+                        ${key('Toggle Theater Cinema Mode', 'G')}
+                        ${key('Replay current/prev subtitle', 'R')}
+                        ${key('Copy subtitle line', 'Shift X')}
+                        ${key('Mini player (PiP)', 'P')}
+                        ${key('Cycle cinema zoom', 'Z')}
+                        ${key('Speed − / + / 1x', '[ / ] / \\')}
+                        ${key('A–B loop set A / B / clear', 'Shift [ / ] / \\')}
+                        ${key('Seek ±30s', 'Shift ← / →')}
+                        ${key('Volume boost ±10%', 'Shift ↑ / ↓')}
+                        ${key('Hide / show subtitles', 'Shift C')}
+                        ${key('Screenshot', 'Shift S')}
+                        ${key('Cycle sleep timer', 'Shift T')}
+                    </div>
+                    <p class="nfp-note">Netflix's own keys (Space, F, M, ← / →, ↑ / ↓) are left untouched so nothing fires twice.</p>`)}
+
+                <div class="nfp-ft"><span>Netflix Helper Pro+ v${VERSION}</span><button type="button" class="nfp-link" id="nfpReset">Reset all settings</button></div>
+            </div>`);
+
+            this.launcher = document.createElement('button');
+            this.launcher.type = 'button';
+            this.launcher.className = 'nfp-launch';
+            this.launcher.title = 'Netflix Helper Pro+ (F2)';
+            this.launcher.textContent = '🎬';
+
+            this.lights = document.createElement('div');
+            this.lights.className = 'nfp-lights';
+            setHTML(this.lights, '<div class="nfp-marquee" id="nfpMarquee">🍿 INTERMISSION <span id="nfpMqMeta"></span></div>');
+
+            this.toasts = document.createElement('div');
+            this.toasts.className = 'nfp-toasts';
+
+            this._mount();
+        }
+
+        _mount() {
+            const host = DOM.host();
+            [this.lights, this.panel, this.launcher, this.toasts].forEach(el => {
+                if (el && el.parentNode !== host) host.appendChild(el);
+            });
+        }
+
+        /* ───────── Cinema Mode orchestration ───────── */
+        _effectiveAudioMode() {
+            const explicit = S.get('audioMode');
+            if (explicit !== 'off') return explicit;
+            if (S.get('cinemaMode') && S.get('cinemaSound')) return 'theater';
+            return 'off';
+        }
+
+        _syncCinemaUI() {
+            const on = !!S.get('cinemaMode');
+            const hero = this.$('nfpHero'), btn = this.$('nfpCinemaBtn');
+            if (hero) hero.classList.toggle('on', on);
+            if (btn) btn.textContent = on ? 'Active ✓' : 'Enter';
+            this.panel.classList.toggle('cinema-vanish', on);
+
+            [
+                ['nfpCLights', 'cinemaLights'],
+                ['nfpCSound', 'cinemaSound'],
+                ['nfpCSubs', 'cinemaSubs'],
+                ['nfpCAmbi', 'cinemaAmbi']
+            ].forEach(([id, key]) => {
+                const el = this.$(id);
+                if (el) el.checked = !!S.get(key);
+            });
+        }
+
+        _applyCinema(v) {
+            v = v || DOM.video();
+            const on = !!S.get('cinemaMode') && isWatchPage();
+            this._syncCinemaUI();
+            this._applySubsCss();
+            this._applyZoom(v);
+            this.ambi.sync(on && !!S.get('cinemaAmbi'), v);
+            this._syncHouseLights(v);
+            if (v && isWatchPage()) {
+                this.audio.apply(S.get('boost'), this._effectiveAudioMode(), v).then(res => {
+                    if (res === 'pending') this._armGesture('audio', () => this._applyCinema(DOM.video()));
+                });
+            }
+        }
+
+        toggleCinema() {
+            const next = !S.get('cinemaMode');
+            S.set('cinemaMode', next);
+            this._applyCinema();
+            this.toast(next ? '🍿 Cinema Mode — house lights dimmed' : '💡 Cinema Mode off', 'cinema');
+        }
+
+        _updateMarquee(v) {
+            if (!this.lights) return;
+            const meta = this.lights.querySelector('#nfpMqMeta');
+            if (!meta) return;
+            if (!v) { meta.textContent = ''; return; }
+            const dur = NFPlayer.duration() || (isFinite(v.duration) ? v.duration : 0);
+            const cur = NFPlayer.currentTime() || v.currentTime || 0;
+            const rem = dur > 0 ? Math.max(0, (dur - cur) / (v.playbackRate || 1)) : 0;
+            const info = dur > 0 ? `· ${DOM.title()} · ${fmtClock(rem)} left · Ends ${fmtWallTime(rem)}` : `· ${DOM.title()}`;
+            meta.textContent = info;
+        }
+
+        _syncHouseLights(v) {
+            clearTimeout(this._pauseT);
+            if (!this.lights) return;
+            const want = !!S.get('cinemaMode') && !!S.get('cinemaLights') && isWatchPage() && !!v;
+            if (!want || !v.paused || v.ended || this._seeking) {
+                this.lights.classList.remove('paused');
+                return;
+            }
+            this._pauseT = setTimeout(() => {
+                if (this._dead || !v.paused || !isWatchPage() || !S.get('cinemaMode') || !S.get('cinemaLights')) return;
+                this._updateMarquee(v);
+                this.lights.classList.add('paused');
+            }, 350);
+        }
+
+        /* ───────── visibility / position ───────── */
+        _panelShown() { return !!this.panel && this.panel.style.display !== 'none'; }
+
+        _syncVisibility() {
+            const watch = isWatchPage();
+            if (this._wasWatch !== watch) {
+                this._wasWatch = watch;
+                this._force = false;
+                this._enforceBrowseMute();
+                if (!watch) {
+                    this.ambi.stop();
+                    if (this.lights) this.lights.classList.remove('paused');
+                }
+            }
+            const show = this.open && (watch || this._force);
+            this.panel.style.display = show ? '' : 'none';
+            this.launcher.style.display = (!show && (watch || S.get('browseLauncher'))) ? '' : 'none';
+            if (show) this._clampToViewport();
+            if (!show) this.fps.stop();
+        }
+
+        toggle() {
+            if (this._panelShown()) {
+                this.open = false;
+            } else {
+                this.open = true;
+                this._force = !isWatchPage();
+            }
+            S.set('panelOpen', this.open);
+            this._syncVisibility();
+        }
+
+        _place(l, t) {
+            const p = this.panel;
+            const w = p.offsetWidth || 356, keep = 90;
+            l = clamp(l, keep - w, window.innerWidth - keep);
+            t = clamp(t, 0, window.innerHeight - 44);
+            p.style.left = l + 'px';
+            p.style.top = t + 'px';
+            p.style.right = 'auto';
+        }
+
+        _clampToViewport() {
+            const p = this.panel;
+            if (!p || !p.offsetWidth || p.style.left === '') return;
+            const r = p.getBoundingClientRect();
+            this._place(r.left, r.top);
+        }
+
+        _drag() {
+            const panel = this.panel, hd = this.$('nfpHd');
+            let drag = null;
+
+            this._on(hd, 'pointerdown', e => {
+                if (e.button !== 0 || e.target.closest('.nfp-btns')) return;
+                const r = panel.getBoundingClientRect();
+                drag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, l: r.left, t: r.top };
+                try { hd.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+                hd.classList.add('drag');
+                e.preventDefault();
+            });
+            this._on(hd, 'pointermove', e => {
+                if (!drag || e.pointerId !== drag.id) return;
+                this._place(drag.l + e.clientX - drag.sx, drag.t + e.clientY - drag.sy);
+            });
+            const end = e => {
+                if (!drag || (e && e.pointerId !== undefined && e.pointerId !== drag.id)) return;
+                try { hd.releasePointerCapture(drag.id); } catch { /* ignore */ }
+                drag = null;
+                hd.classList.remove('drag');
+                const r = panel.getBoundingClientRect();
+                S.set('pos', { l: Math.round(r.left), t: Math.round(r.top) });
+            };
+            ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(t => this._on(hd, t, end));
+            this._on(window, 'blur', () => end());
+            this._on(window, 'resize', () => this._clampToViewport());
+
+            this._on(hd, 'dblclick', e => {
+                if (e.target.closest('.nfp-btns')) return;
+                panel.style.left = ''; panel.style.top = ''; panel.style.right = '';
+                S.set('pos', null);
+            });
+
+            this._on(panel, 'mouseenter', () => { clearTimeout(this._dimT); panel.classList.remove('dim'); });
+            this._on(panel, 'mouseleave', () => {
+                clearTimeout(this._dimT);
+                this._dimT = setTimeout(() => { if (!drag) panel.classList.add('dim'); }, CFG.dimDelay);
+            });
+
+            // Wake invisible Cinema Mode panel when cursor reaches top-right corner
+            this._on(document, 'mousemove', e => {
+                if (!S.get('cinemaMode') || !panel.classList.contains('dim')) return;
+                const r = panel.getBoundingClientRect();
+                if (e.clientX >= r.left - 24 && e.clientX <= r.right + 24 && e.clientY >= r.top - 24 && e.clientY <= r.top + 80) {
+                    panel.classList.remove('dim');
+                    clearTimeout(this._dimT);
+                    this._dimT = setTimeout(() => panel.classList.add('dim'), CFG.dimDelay);
+                }
+            });
+
+            const minBtn = this.$('nfpMin');
+            this._on(minBtn, 'click', () => {
+                const m = panel.classList.toggle('min');
+                minBtn.textContent = m ? '□' : '−';
+                S.set('minimized', m);
+                if (m) this.fps.stop();
+            });
+            this._on(this.$('nfpX'), 'click', () => { this.open = false; this._force = false; S.set('panelOpen', false); this._syncVisibility(); });
+            this._on(this.launcher, 'click', () => { this.open = true; this._force = !isWatchPage(); S.set('panelOpen', true); this._syncVisibility(); });
+        }
+
+        /* ───────── toasts ───────── */
+        toast(msg, key) {
+            if (this._dead || !this.toasts) return;
+            if (key && this._toastMap.has(key)) this._toastMap.get(key).remove();
+            const el = document.createElement('div');
+            el.className = 'nfp-toast';
+            el.textContent = msg;
+            this.toasts.appendChild(el);
+            if (key) this._toastMap.set(key, el);
+            setTimeout(() => {
+                el.remove();
+                if (key && this._toastMap.get(key) === el) this._toastMap.delete(key);
+            }, 2300);
+        }
+
+        /* ───────── live stats ───────── */
+        _bufferAhead(v) {
+            try {
+                const t = v.currentTime, b = v.buffered;
+                for (let i = 0; i < b.length; i++) {
+                    if (t >= b.start(i) - 0.1 && t <= b.end(i)) return b.end(i) - t;
+                }
+            } catch { /* ignore */ }
+            return 0;
+        }
+
+        _pill(id, on, text) {
+            const el = this.$(id);
+            if (!el) return;
+            el.classList.toggle('on', on);
+            el.lastElementChild.textContent = text;
+        }
+
+        _tick() {
+            if (this._dead) return;
+            const v = DOM.video();
+            const watching = !!v && isWatchPage();
+            const playing = watching && !v.paused && !v.ended && v.readyState >= 3;
+
+            this.watch.tick(playing);
+            this.sleep.tick(watching ? v : null);
+            this.browse.tick();
+            if (watching) this._autoLoadSeriesProfile();
+            const mbps = this.net.sample();
+
+            if (watching && this.lights && this.lights.classList.contains('paused')) {
+                this._updateMarquee(v);
+            }
+
+            const statsOpen = this._panelShown() && !this.panel.classList.contains('min') && !!this.panel.querySelector('details[data-sec="stats"]')?.open;
+            this.fps.sync(v, watching && statsOpen);
+
+            if (!this._panelShown() || this.panel.classList.contains('min')) return;
+            const set = (id, txt) => { const el = this.$(id); if (el && el.textContent !== txt) el.textContent = txt; };
+
+            if (watching) {
+                set('nfpRes', v.videoWidth ? `${v.videoWidth}×${v.videoHeight}` : '–');
+                set('nfpFps', this.fps.fps > 0 ? `${this.fps.fps.toFixed(2).replace(/\.00$/, '')} fps` : '–');
+                set('nfpBuf', `${Math.round(this._bufferAhead(v))}s`);
+
+                let dropped = 0, total = 0;
+                if (typeof v.getVideoPlaybackQuality === 'function') {
+                    try { const q = v.getVideoPlaybackQuality(); dropped = q.droppedVideoFrames || 0; total = q.totalVideoFrames || 0; }
+                    catch { /* ignore */ }
+                } else {
+                    dropped = v.webkitDroppedFrameCount || 0;
+                }
+                set('nfpDr', total ? `${dropped}/${total}` : String(dropped));
+
+                const dur = NFPlayer.duration() || (isFinite(v.duration) ? v.duration : 0);
+                const cur = NFPlayer.currentTime() || v.currentTime || 0;
+                const rem = dur > 0 ? Math.max(0, (dur - cur) / (v.playbackRate || 1)) : 0;
+                set('nfpLeft', dur > 0 ? fmtClock(rem) : '–');
+                set('nfpEnd', dur > 0 ? fmtWallTime(rem) : '–');
+
+                const a = this.net.avg();
+                if (this.net.blocked) { set('nfpNet', 'n/a*'); set('nfpAvg', 'n/a*'); }
+                else {
+                    set('nfpNet', mbps > 0 ? `${mbps.toFixed(1)} Mbps` : 'idle');
+                    set('nfpAvg', a > 0 ? `${a.toFixed(1)} Mbps` : '–');
+                }
+                const note = this.$('nfpNetNote');
+                if (note) note.hidden = !this.net.blocked;
+
+                const mt = this.$('nfpMt');
+                if (mt) mt.textContent = v.muted ? '🔊 Unmute' : '🔇 Mute';
+                this._syncPinUI();
+                if (this.panel.querySelector('details[data-sec="tools"]')?.open) this._syncTrackLists();
+            } else {
+                ['nfpRes', 'nfpFps', 'nfpNet', 'nfpAvg', 'nfpBuf', 'nfpDr', 'nfpLeft', 'nfpEnd'].forEach(id => set(id, '–'));
+                set('nfpPinSt', 'Not on watch page');
+            }
+
+            set('nfpToday', fmtDur(this.watch.today()));
+            set('nfpH1', fmtDur(this.watch.today()));
+            set('nfpH7', fmtDur(this.watch.days(7)));
+            set('nfpHT', fmtDur(this.watch.total()));
+            set('nfpHS', fmtDur(this.watch.session));
+            const ss = S.get('skipStats');
+            set('nfpHK', `${ss.count} · ${fmtDur(ss.sec)} saved`);
+            set('nfpSleepSt', this.sleep.label());
+
+            const ai = S.get('autoIntro'), an = S.get('autoNext'), pip = !!document.pictureInPictureElement;
+            this._pill('nfpPillI', ai, `Skip intro: ${ai ? 'on' : 'off'}`);
+            this._pill('nfpPillN', an, `Next episode: ${an ? 'on' : 'off'}`);
+            this._pill('nfpPillP', pip, `Mini player: ${pip ? 'on' : 'off'}`);
+            const pb = this.$('nfpPip');
+            if (pb) pb.classList.toggle('active', pip);
+        }
+
+        recordSkip(t0) {
+            setTimeout(() => {
+                const v = DOM.video();
+                const d = NFPlayer.currentTime() - t0 - 1.65 * ((v && v.playbackRate) || 1);
+                const st = S.get('skipStats');
+                S.set('skipStats', { count: (st.count || 0) + 1, sec: (st.sec || 0) + (d > 1 && d < 900 ? d : 0) });
+            }, 1500);
+        }
+
+        /* ───────── picture filters ───────── */
+        _ensureSvgFilter(gamma, temp, sh) {
+            const sig = `${gamma}|${temp}|${sh}`;
+            let svg = document.getElementById('nfp-svg');
+            if (svg && this._svgSig === sig) return;
+            this._svgSig = sig;
+
+            const NS = 'http://www.w3.org/2000/svg';
+            if (!svg) {
+                svg = document.createElementNS(NS, 'svg');
+                svg.id = 'nfp-svg';
+                svg.setAttribute('width', '0');
+                svg.setAttribute('height', '0');
+                svg.setAttribute('aria-hidden', 'true');
+                svg.style.position = 'absolute';
+                document.body.appendChild(svg);
+            }
+            while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+            const f = document.createElementNS(NS, 'filter');
+            f.id = 'nfp-fx';
+            f.setAttribute('color-interpolation-filters', 'sRGB');
+            f.setAttribute('x', '0');
+            f.setAttribute('y', '0');
+            f.setAttribute('width', '1');
+            f.setAttribute('height', '1');
+
+            if (gamma !== 100) {
+                const exp = (100 / gamma).toFixed(3);
+                const ct = document.createElementNS(NS, 'feComponentTransfer');
+                ['feFuncR', 'feFuncG', 'feFuncB'].forEach(tag => {
+                    const fn = document.createElementNS(NS, tag);
+                    fn.setAttribute('type', 'gamma');
+                    fn.setAttribute('amplitude', '1');
+                    fn.setAttribute('exponent', exp);
+                    fn.setAttribute('offset', '0');
+                    ct.appendChild(fn);
+                });
+                f.appendChild(ct);
+            }
+
+            if (temp !== 0) {
+                const t = temp / 50;
+                const r = 1 + 0.10 * t;
+                const g = t > 0 ? 1 + 0.02 * t : 1;
+                const b = t > 0 ? 1 - 0.14 * t : 1 - 0.12 * t;
+                const cm = document.createElementNS(NS, 'feColorMatrix');
+                cm.setAttribute('type', 'matrix');
+                cm.setAttribute('values', `${r.toFixed(3)} 0 0 0 0 0 ${g.toFixed(3)} 0 0 0 0 0 ${b.toFixed(3)} 0 0 0 0 0 1 0`);
+                f.appendChild(cm);
+            }
+
+            if (sh > 0) {
+                const a = (sh / 100) * 0.85;
+                const m = document.createElementNS(NS, 'feConvolveMatrix');
+                m.setAttribute('order', '3');
+                m.setAttribute('divisor', '1');
+                m.setAttribute('preserveAlpha', 'true');
+                m.setAttribute('kernelMatrix', `0 ${-a.toFixed(3)} 0 ${-a.toFixed(3)} ${(1 + 4 * a).toFixed(3)} ${-a.toFixed(3)} 0 ${-a.toFixed(3)} 0`);
+                f.appendChild(m);
+            }
+
+            svg.appendChild(f);
+        }
+
+        _applyFilters(v) {
+            v = v || DOM.video();
+            if (!v) return;
+            const { brightness: b, contrast: c, saturation: s, gamma: g, temp: t, sharpness: sh } = this.filters;
+            const parts = [];
+            if (b !== 100) parts.push(`brightness(${b}%)`);
+            if (c !== 100) parts.push(`contrast(${c}%)`);
+            if (s !== 100) parts.push(`saturate(${s}%)`);
+            if (g !== 100 || t !== 0 || sh > 0) {
+                this._ensureSvgFilter(g, t, sh);
+                parts.push('url(#nfp-fx)');
+            }
+            const str = parts.join(' ');
+            if (this._fApplied.get(v) === str && !!v.style.filter === !!str) return;
+            v.style.filter = str;
+            this._fApplied.set(v, str);
+        }
+
+        _filterRows() {
+            return [
+                { sl: 'nfpGam', vl: 'nfpGamV', key: 'gamma', fmt: n => (n / 100).toFixed(2) },
+                { sl: 'nfpSh', vl: 'nfpShV', key: 'sharpness', fmt: n => n === 0 ? 'Off' : n + '%' },
+                { sl: 'nfpTmp', vl: 'nfpTmpV', key: 'temp', fmt: n => n === 0 ? 'Neutral' : (n > 0 ? `Warm +${n}` : `Cool ${n}`) },
+                { sl: 'nfpBri', vl: 'nfpBriV', key: 'brightness', fmt: n => n + '%' },
+                { sl: 'nfpCon', vl: 'nfpConV', key: 'contrast', fmt: n => n + '%' },
+                { sl: 'nfpSat', vl: 'nfpSatV', key: 'saturation', fmt: n => n + '%' }
+            ];
+        }
+
+        _syncFilterUI() {
+            this._filterRows().forEach(({ sl, vl, key, fmt }) => {
+                const el = this.$(sl), ve = this.$(vl);
+                if (el) el.value = this.filters[key];
+                if (ve) ve.textContent = fmt(this.filters[key]);
+            });
+            const match = Object.keys(this.presets)
+                .find(n => Object.keys(this.presets[n]).every(k => this.presets[n][k] === this.filters[k]));
+            const pre = this.$('nfpPre');
+            if (pre) pre.value = match || 'Custom';
+        }
+
+        _setFilters(obj) {
+            Object.assign(this.filters, obj);
+            S.set('filters', Object.assign({}, this.filters));
+            this._applyFilters();
+            this._syncFilterUI();
+        }
+
+        /* ───────── ultrawide / zoom & auto black-bar detector ───────── */
+        _applyZoom(v) {
+            v = v || DOM.video();
+            if (!v) return;
+            const z = S.get('zoom');
+            const frame = isWatchPage() && !!S.get('cinemaMode') && !!S.get('cinemaAmbi') && z === 100;
+            v.classList.toggle('nfp-screen-frame', frame);
+            const val = frame ? '0.92' : (z === 100 ? '' : String((z / 100).toFixed(3)));
+            if (this._zApplied.get(v) === val && !!v.style.scale === !!val) return;
+            v.style.scale = val;
+            this._zApplied.set(v, val);
+        }
+
+        _syncZoomUI() {
+            const z = S.get('zoom');
+            const sl = this.$('nfpZm'), sv = this.$('nfpZmV');
+            if (sl) sl.value = z;
+            if (sv) sv.textContent = z === 100 ? 'Fit (100%)' : `${z}%`;
+            this.panel.querySelectorAll('[data-zoom]')
+                .forEach(b => b.classList.toggle('active', parseInt(b.dataset.zoom, 10) === z));
+        }
+
+        _setZoom(val) {
+            val = clamp(Math.round(val), 100, 150);
+            S.set('zoom', val);
+            this._applyZoom();
+            this._syncZoomUI();
+            return val;
+        }
+
+        _autoCropBars() {
+            const v = DOM.video();
+            if (!v || !v.videoWidth) { this.toast('⚠️ Play a video first', 'zoom'); return; }
+            try {
+                const W = 64, H = 180;
+                const c = document.createElement('canvas');
+                c.width = W; c.height = H;
+                const ctx = c.getContext('2d');
+                ctx.drawImage(v, 0, 0, W, H);
+                const px = ctx.getImageData(0, 0, W, H).data;
+
+                const rowLit = y => {
+                    let bright = 0;
+                    for (let x = 8; x < W - 8; x += 4) {
+                        const i = (y * W + x) * 4;
+                        if (px[i] > 15 || px[i + 1] > 15 || px[i + 2] > 15) bright++;
+                    }
+                    return bright >= 2;
+                };
+
+                let top = 0, bot = H - 1;
+                while (top < H / 2 && !rowLit(top)) top++;
+                while (bot > H / 2 && !rowLit(bot)) bot--;
+                const active = bot - top + 1;
+                if (active <= 10 || top >= H / 2 - 2) {
+                    this.toast('ℹ️ Frame unreadable (DRM or dark scene) — try 2.00:1 or 21:9', 'zoom');
+                    return;
+                }
+                const ratio = clamp(Math.round((H / active) * 100), 100, 150);
+                this._setZoom(ratio);
+                this.toast(ratio === 100 ? '✨ No letterbox bars detected (100%)' : `✨ Auto-cropped black bars (${ratio}%)`, 'zoom');
+            } catch {
+                this.toast('ℹ️ Auto-crop blocked by DRM — use 2.00:1 or 21:9 preset', 'zoom');
+            }
+        }
+
+        /* ───────── subtitles (including Cinema Silver-Warm tint) ───────── */
+        _applySubsCss() {
+            const { size, lift, bg, hidden } = this.subs;
+            const silver = !!S.get('cinemaMode') && !!S.get('cinemaSubs');
+            let el = document.getElementById('nfp-subs-style');
+            if (size === 100 && lift === 0 && !bg && !hidden && !silver) {
+                if (el) el.remove();
+                return;
+            }
+            if (!el) {
+                el = document.createElement('style');
+                el.id = 'nfp-subs-style';
+                document.head.appendChild(el);
+            }
+            const rules = [];
+            if (hidden) {
+                rules.push('.watch-video .player-timedtext { opacity: 0 !important; pointer-events: none !important; }');
+            } else {
+                if (lift > 0) {
+                    rules.push(`.watch-video .player-timedtext { translate: 0 -${lift}vh !important; }`);
+                }
+                if (size !== 100) {
+                    rules.push(`.watch-video .player-timedtext-text-container { scale: ${(size / 100).toFixed(2)} !important; transform-origin: center bottom !important; }`);
+                }
+                if (silver) {
+                    rules.push('.watch-video .player-timedtext-text-container span { color: rgba(244, 237, 222, 0.92) !important; text-shadow: 0 2px 6px rgba(0,0,0,.95), 0 0 2px rgba(0,0,0,.9) !important; }');
+                }
+                if (bg) {
+                    rules.push('.watch-video .player-timedtext-text-container span { background: rgba(0,0,0,.72) !important; padding: .08em .36em !important; border-radius: 5px !important; box-decoration-break: clone; -webkit-box-decoration-break: clone; }');
+                }
+            }
+            el.textContent = rules.join('\n');
+        }
+
+        _syncSubsUI() {
+            const { size, lift, bg, hidden } = this.subs;
+            const ss = this.$('nfpSubS'), ssv = this.$('nfpSubSV');
+            const sl = this.$('nfpSubL'), slv = this.$('nfpSubLV');
+            const cbg = this.$('nfpSubBg'), chid = this.$('nfpSubHid');
+            if (ss) ss.value = size;
+            if (ssv) ssv.textContent = size + '%';
+            if (sl) sl.value = lift;
+            if (slv) slv.textContent = lift === 0 ? 'Default' : `+${lift}%`;
+            if (cbg) cbg.checked = !!bg;
+            if (chid) chid.checked = !!hidden;
+        }
+
+        _setSubs(patch) {
+            Object.assign(this.subs, patch);
+            S.set('subs', Object.assign({}, this.subs));
+            this._applySubsCss();
+            this._syncSubsUI();
+        }
+
+        _renderSubLog() {
+            const box = this.$('nfpSubLog');
+            if (!box) return;
+            const list = this.subTracker.lines;
+            if (!list.length) {
+                setHTML(box, '<span class="nfp-note" style="margin:0">Subtitles will appear here while playing…</span>');
+                return;
+            }
+            const html = list.slice().reverse().map((it, idx) => {
+                const safe = it.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                return `<button type="button" class="nfp-subitem" data-subidx="${list.length - 1 - idx}"><span class="nfp-subt">${fmtClock(it.t)}</span><span>${safe}</span></button>`;
+            }).join('');
+            setHTML(box, html);
+        }
+
+        _replaySub() {
+            const item = this.subTracker.replay();
+            if (!item) { this.toast('ℹ️ No recent subtitle line recorded yet', 'subs'); return; }
+            this.toast(`⏪ ${fmtClock(item.t)} · ${item.text.slice(0, 42)}`, 'subs');
+        }
+
+        _copySub() {
+            const txt = this.subTracker.currentText() || (this.subTracker.lines[this.subTracker.lines.length - 1]?.text ?? '');
+            if (!txt) { this.toast('ℹ️ No subtitle text to copy', 'subs'); return; }
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(txt).then(() => this.toast('📋 Copied subtitle line', 'subs')).catch(() => this.toast('⚠️ Clipboard blocked', 'subs'));
+            }
+        }
+
+        /* ───────── anti-spoiler & per-series memory ───────── */
+        _applySpoilerCss() {
+            let el = document.getElementById('nfp-spoiler-style');
+            if (!S.get('antiSpoiler')) {
+                if (el) el.remove();
+                return;
+            }
+            if (!el) {
+                el = document.createElement('style');
+                el.id = 'nfp-spoiler-style';
+                document.head.appendChild(el);
+            }
+            el.textContent = `
+            .episodeSelector-item .titleCard-imageWrapper img, [data-uia="episode-item"] img { filter: blur(16px) brightness(0.7) !important; transition: filter .25s ease !important; }
+            .episodeSelector-item .titleCard-synopsis, [data-uia="episode-item"] p, .watch-video [data-uia="evidence-overlay-synopsis"] { filter: blur(7px) !important; transition: filter .25s ease !important; }
+            .episodeSelector-item:hover .titleCard-imageWrapper img, [data-uia="episode-item"]:hover img,
+            .episodeSelector-item:hover .titleCard-synopsis, [data-uia="episode-item"]:hover p,
+            .watch-video [data-uia="evidence-overlay-synopsis"]:hover { filter: none !important; }`;
+        }
+
+        _syncPinUI() {
+            const st = this.$('nfpPinSt');
+            if (!st) return;
+            const name = DOM.seriesName();
+            if (!name) { st.textContent = 'Detecting title…'; return; }
+            const map = S.get('showProfiles') || {};
+            st.textContent = map[name] ? `Saved: ${name}` : `None (${name})`;
+        }
+
+        _saveSeriesProfile() {
+            const name = DOM.seriesName();
+            if (!name) { this.toast('⚠️ Play a title first so its name can be detected', 'pin'); return; }
+            const map = Object.assign({}, S.get('showProfiles') || {});
+            map[name] = {
+                speed: S.get('speed'),
+                zoom: S.get('zoom'),
+                filters: Object.assign({}, this.filters),
+                audioMode: S.get('audioMode'),
+                cinemaMode: S.get('cinemaMode'),
+                subLift: this.subs.lift
+            };
+            S.set('showProfiles', map);
+            this._loadedSeries = name;
+            this._syncPinUI();
+            this.toast(`📌 Saved profile for ${name}`, 'pin');
+        }
+
+        _clearSeriesProfile() {
+            const name = DOM.seriesName();
+            const map = Object.assign({}, S.get('showProfiles') || {});
+            if (!name || !map[name]) { this.toast('ℹ️ No saved profile for this show', 'pin'); return; }
+            delete map[name];
+            S.set('showProfiles', map);
+            this._syncPinUI();
+            this.toast(`🗑️ Removed profile for ${name}`, 'pin');
+        }
+
+        _autoLoadSeriesProfile() {
+            const name = DOM.seriesName();
+            if (!name || name === this._loadedSeries) return;
+            this._loadedSeries = name;
+            const p = (S.get('showProfiles') || {})[name];
+            if (!p) return;
+            if (typeof p.speed === 'number') this._setSpeed(p.speed);
+            if (typeof p.zoom === 'number') this._setZoom(p.zoom);
+            if (p.filters) this._setFilters(p.filters);
+            if (typeof p.subLift === 'number') this._setSubs({ lift: p.subLift });
+            if (typeof p.cinemaMode === 'boolean') S.set('cinemaMode', p.cinemaMode);
+            if (p.audioMode) this._setAudio(S.get('boost'), p.audioMode);
+            this._applyCinema();
+            this.toast(`📌 Loaded profile: ${name}`, 'pin');
+        }
+
+        /* ───────── speed ───────── */
+        _applySpeed(v) {
+            v = v || DOM.video();
+            if (!v) return;
+            const sp = S.get('speed');
+            try { v.preservesPitch = true; } catch { /* ignore */ }
+            if (Math.abs(v.playbackRate - sp) > 0.001) v.playbackRate = sp;
+        }
+
+        _syncSpeedUI() {
+            const sp = S.get('speed');
+            const sl = this.$('nfpSp'), sv = this.$('nfpSpV');
+            if (sl) sl.value = sp;
+            if (sv) sv.textContent = sp.toFixed(2) + 'x';
+            this.panel.querySelectorAll('[data-speed]')
+                .forEach(b => b.classList.toggle('active', Math.abs(parseFloat(b.dataset.speed) - sp) < 0.001));
+        }
+
+        _setSpeed(val) {
+            val = clamp(Math.round(val * 20) / 20, 0.25, 3);
+            S.set('speed', val);
+            this._applySpeed();
+            this._syncSpeedUI();
+            return val;
+        }
+
+        /* ───────── audio boost & profiles ───────── */
+        _syncAudioUI() {
+            const b = S.get('boost'), m = S.get('audioMode');
+            const sl = this.$('nfpBoost'), sv = this.$('nfpBoostV'), sel = this.$('nfpAudM');
+            if (sl) sl.value = b;
+            if (sv) sv.textContent = b + '%';
+            if (sel) sel.value = m;
+        }
+
+        async _setAudio(pct, mode) {
+            pct = clamp(Math.round(pct / 10) * 10, 100, 300);
+            mode = AUDIO_PRESETS[mode] ? mode : 'off';
+            S.set('boost', pct);
+            S.set('audioMode', mode);
+            this._syncAudioUI();
+            const res = await this.audio.apply(pct, this._effectiveAudioMode(), DOM.video());
+            if (res === false) {
+                S.set('boost', 100);
+                S.set('audioMode', 'off');
+                this._syncAudioUI();
+                this.toast('⚠️ Web Audio enhancement isn\'t available on this page', 'boost');
+            } else if (res === 'pending') {
+                this._armGesture('audio', () => this._setAudio(S.get('boost'), S.get('audioMode')));
+            }
+            return pct;
+        }
+
+        _armGesture(flag, fn) {
+            if (this._gestureArmed[flag] || this._dead) return;
+            this._gestureArmed[flag] = true;
+            const h = () => {
+                document.removeEventListener('pointerdown', h, true);
+                document.removeEventListener('keydown', h, true);
+                this._gestureArmed[flag] = false;
+                if (!this._dead) fn();
+            };
+            document.addEventListener('pointerdown', h, true);
+            document.addEventListener('keydown', h, true);
+        }
+
+        /* ───────── A-B loop ───────── */
+        _syncAbUI() {
+            const st = this.$('nfpAbSt'), ba = this.$('nfpAbA'), bb = this.$('nfpAbB');
+            const { a, b } = this.ab;
+            if (ba) { ba.textContent = a !== null ? `A: ${fmtClock(a)}` : 'Set A'; ba.classList.toggle('active', a !== null); }
+            if (bb) { bb.textContent = b !== null ? `B: ${fmtClock(b)}` : 'Set B'; bb.classList.toggle('active', b !== null); }
+            if (st) st.textContent = (a !== null && b !== null) ? `${fmtClock(a)} → ${fmtClock(b)}` : (a !== null ? `A=${fmtClock(a)}` : 'Off');
+        }
+
+        _setAb(which) {
+            if (which === 'clear') {
+                this.ab = { a: null, b: null };
+                this._syncAbUI();
+                this.toast('🔁 A–B loop cleared', 'ab');
+                return;
+            }
+            const t = NFPlayer.currentTime() || (DOM.video()?.currentTime ?? 0);
+            if (which === 'a') {
+                this.ab.a = t;
+                if (this.ab.b !== null && this.ab.b <= t + 1) this.ab.b = null;
+                this.toast(`🔁 Loop A set at ${fmtClock(t)}`, 'ab');
+            } else if (which === 'b') {
+                if (this.ab.a === null) this.ab.a = Math.max(0, t - 5);
+                if (t <= this.ab.a + 1) { this.toast('⚠️ Point B must be at least 1s after A', 'ab'); return; }
+                this.ab.b = t;
+                this.toast(`🔁 Looping ${fmtClock(this.ab.a)} → ${fmtClock(t)}`, 'ab');
+            }
+            this._syncAbUI();
+        }
+
+        /* ───────── browse-page autoplay preview muter ───────── */
+        _enforceBrowseMute() {
+            const mute = S.get('muteBrowse');
+            if (isWatchPage()) return;
+            document.querySelectorAll('video').forEach(v => {
+                if (mute) {
+                    if (!v.muted) { v.muted = true; this._autoMuted.add(v); }
+                } else if (this._autoMuted.has(v)) {
+                    v.muted = false;
+                    this._autoMuted.delete(v);
+                }
+            });
+        }
+
+        _wireBrowseMute() {
+            const handler = e => {
+                if (!S.get('muteBrowse') || isWatchPage()) return;
+                const v = e.target;
+                if (v && v.tagName === 'VIDEO' && !v.muted) {
+                    v.muted = true;
+                    this._autoMuted.add(v);
+                }
+            };
+            this._on(document, 'play', handler, true);
+            this._on(document, 'volumechange', handler, true);
+        }
+
+        /* ───────── sleep timer ───────── */
+        _syncSleepUI() {
+            const sel = this.$('nfpSleep');
+            if (sel) sel.value = this.sleep.mode ? this.sleep.choice : '0';
+            const st = this.$('nfpSleepSt');
+            if (st) st.textContent = this.sleep.label();
+        }
+
+        _setSleep(val) {
+            this.sleep.set(val);
+            this._syncSleepUI();
+            this.toast(this.sleep.mode ? `😴 Sleep timer: ${this.sleep.label()}` : 'Sleep timer off', 'sleep');
+        }
+
+        pauseVideo() {
+            if (!NFPlayer.pause()) { const v = DOM.video(); if (v) v.pause(); }
+        }
+
+        /* ───────── actions ───────── */
+        _seek(seconds) {
+            if (this._seeking) return;
+            this._seeking = true;
+            this.skip.suspend(2000);
+            if (NFPlayer.seekBy(seconds)) {
+                this.toast(`${seconds > 0 ? '⏩ +' : '⏪ '}${seconds}s`, 'seek');
+            } else {
+                warn('Netflix player API not available — seek skipped');
+                this.toast('⚠️ Seek unavailable', 'seek');
+            }
+            setTimeout(() => { this._seeking = false; }, 200);
+        }
+
+        _fs() {
+            if (DOM.fsRoot()) {
+                (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+            } else {
+                const de = document.documentElement;
+                const fn = de.requestFullscreen || de.webkitRequestFullscreen;
+                if (fn) fn.call(de);
+            }
+        }
+
+        _mute() {
+            let muted = NFPlayer.call(p => { const m = !p.getMuted(); p.setMuted(m); return m; }, null);
+            if (muted === null) {
+                const v = DOM.video();
+                if (!v) return;
+                v.muted = !v.muted;
+                muted = v.muted;
+            }
+            this.toast(muted ? '🔇 Muted' : '🔊 Unmuted', 'mute');
+        }
+
+        async _screenshot() {
+            const v = DOM.video();
+            if (!v || !v.videoWidth) { this.toast('⚠️ No video to capture', 'shot'); return; }
+            try {
+                const c = document.createElement('canvas');
+                c.width = v.videoWidth; c.height = v.videoHeight;
+                const ctx = c.getContext('2d');
+                ctx.drawImage(v, 0, 0, c.width, c.height);
+
+                const probe = document.createElement('canvas');
+                probe.width = 32; probe.height = 18;
+                const pctx = probe.getContext('2d');
+                pctx.drawImage(c, 0, 0, 32, 18);
+                const px = pctx.getImageData(0, 0, 32, 18).data;
+                let lit = false;
+                for (let i = 0; i < px.length; i += 4) { if (px[i] > 12 || px[i + 1] > 12 || px[i + 2] > 12) { lit = true; break; } }
+                if (!lit) { this.toast('⚠️ Frame came out blank — this browser blocks captures of DRM-protected video', 'shot'); return; }
+
+                const blob = await new Promise(res => c.toBlob(res, 'image/png'));
+                if (!blob) throw new Error('toBlob returned null');
+                const title = DOM.title().replace(/[^\w-]+/g, '_').slice(0, 60);
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `${title}_${fmtClock(NFPlayer.currentTime() || v.currentTime).replace(/:/g, '-')}.png`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+                this.toast('📸 Screenshot saved', 'shot');
+            } catch (err) {
+                warn('Screenshot failed:', err);
+                this.toast('⚠️ Screenshot blocked by the browser', 'shot');
+            }
+        }
+
+        _nfHotkey(letter) {
+            const code = letter.charCodeAt(0);
+            const init = {
+                key: letter,
+                code: 'Key' + letter,
+                keyCode: code,
+                which: code,
+                ctrlKey: true,
+                altKey: true,
+                shiftKey: true,
+                bubbles: true,
+                cancelable: true,
+                composed: true
+            };
+            const t = document.activeElement || document.body;
+            t.dispatchEvent(new KeyboardEvent('keydown', init));
+            t.dispatchEvent(new KeyboardEvent('keyup', init));
+        }
+
+        _syncTrackLists() {
+            const aSel = this.$('nfpAudTrk'), tSel = this.$('nfpTxtTrk');
+            if (aSel && document.activeElement !== aSel) {
+                const list = NFPlayer.audioTracks();
+                const cur = NFPlayer.currentAudio();
+                const curId = cur && (cur.trackId ?? cur.id ?? '');
+                const sig = list.map(x => x.trackId ?? x.id ?? x.displayName).join('|') + '::' + curId;
+                if (aSel.dataset.sig !== sig) {
+                    aSel.dataset.sig = sig;
+                    setHTML(aSel, list.length
+                        ? list.map((t, i) => {
+                            const id = t.trackId ?? t.id ?? i;
+                            const ch = t.channels ? ` (${t.channels})` : '';
+                            const lbl = (t.displayName || t.languageDescription || t.language || `Track ${i + 1}`) + ch;
+                            const sel = id === curId ? ' selected' : '';
+                            return `<option value="${i}"${sel}>${lbl.replace(/</g, '&lt;')}</option>`;
+                        }).join('')
+                        : '<option value="">No audio tracks exposed</option>');
+                }
+            }
+            if (tSel && document.activeElement !== tSel) {
+                const list = NFPlayer.textTracks();
+                const cur = NFPlayer.currentText();
+                const curId = cur && (cur.trackId ?? cur.id ?? '');
+                const sig = list.map(x => x.trackId ?? x.id ?? x.displayName).join('|') + '::' + curId;
+                if (tSel.dataset.sig !== sig) {
+                    tSel.dataset.sig = sig;
+                    setHTML(tSel, list.length
+                        ? list.map((t, i) => {
+                            const id = t.trackId ?? t.id ?? i;
+                            const cc = t.rawTrackType === 'closedcaptions' || t.isForcedNarrative ? ' [CC/FN]' : '';
+                            const lbl = (t.displayName || t.languageDescription || t.language || 'Off') + cc;
+                            const sel = id === curId ? ' selected' : '';
+                            return `<option value="${i}"${sel}>${lbl.replace(/</g, '&lt;')}</option>`;
+                        }).join('')
+                        : '<option value="">No subtitle tracks exposed</option>');
+                }
+            }
+        }
+
+        _applyMaxBitrate() {
+            if (!S.get('maxBitrate') || !isWatchPage()) return;
+            const kbps = NFPlayer.lockMaxBitrate();
+            if (kbps) log('Locked max offered video bitrate:', kbps);
+        }
+
+        /* ───────── mini player ───────── */
+        async _miniPlayer() {
+            const v = DOM.video();
+            if (!v) { this.toast('⚠️ No video found', 'pip'); return; }
+            try {
+                if (document.pictureInPictureElement) {
+                    this._wantPip = false;
+                    await document.exitPictureInPicture();
+                    return;
+                }
+                if (!document.pictureInPictureEnabled) { this.toast('⚠️ Mini player isn\'t supported by this browser', 'pip'); return; }
+                v.disablePictureInPicture = false;
+                await v.requestPictureInPicture();
+                this._wantPip = true;
+            } catch (err) {
+                warn('Mini player failed:', err);
+                this.toast('⚠️ Mini player unavailable right now', 'pip');
+            }
+        }
+
+        _reattachPip(v) {
+            if (!this._wantPip || !v || !document.pictureInPictureEnabled) return;
+            if (document.pictureInPictureElement === v) return;
+            v.disablePictureInPicture = false;
+            v.requestPictureInPicture()
+                .then(() => this.toast('🖼️ Mini player followed the new episode', 'pip'))
+                .catch(err => {
+                    if (err && err.name === 'NotAllowedError') {
+                        this.toast('🖼️ Click anywhere to bring the mini player back', 'pip');
+                        this._armGesture('pip', () => {
+                            const cur = DOM.video();
+                            if (this._wantPip && cur && !document.pictureInPictureElement) cur.requestPictureInPicture().catch(() => {});
+                        });
+                    } else warn('Mini player re-attach failed:', err);
+                });
+        }
+
+        _bindPip(v) {
+            this._onV(v, 'enterpictureinpicture', () => this.toast('🖼️ Mini player opened', 'pip'));
+            this._onV(v, 'leavepictureinpicture', () => {
+                setTimeout(() => {
+                    if (v.isConnected && this._wantPip) { this._wantPip = false; this.toast('🖼️ Mini player closed', 'pip'); }
+                }, 50);
+            });
+        }
+
+        /* ───────── controls wiring ───────── */
+        _controls() {
+            const $ = id => this.$(id);
+
+            // Cinema Mode banner + sub-options
+            this._on($('nfpCinemaBtn'), 'click', () => this.toggleCinema());
+            [
+                ['nfpCLights', 'cinemaLights'],
+                ['nfpCSound', 'cinemaSound'],
+                ['nfpCSubs', 'cinemaSubs'],
+                ['nfpCAmbi', 'cinemaAmbi']
+            ].forEach(([id, key]) => {
+                this._on($(id), 'change', e => {
+                    S.set(key, e.target.checked);
+                    this._applyCinema();
+                });
+            });
+
+            // speed & zoom
+            this._on($('nfpSp'), 'input', e => this._setSpeed(parseFloat(e.target.value)));
+            this.panel.querySelectorAll('[data-speed]').forEach(b =>
+                this._on(b, 'click', () => this._setSpeed(parseFloat(b.dataset.speed))));
+
+            this._on($('nfpZm'), 'input', e => this._setZoom(parseInt(e.target.value, 10)));
+            this.panel.querySelectorAll('[data-zoom]').forEach(b =>
+                this._on(b, 'click', () => this._setZoom(parseInt(b.dataset.zoom, 10))));
+            this._on($('nfpAutoCrop'), 'click', () => this._autoCropBars());
+
+            // A-B loop & Per-Series Profile
+            this._on($('nfpAbA'), 'click', () => this._setAb('a'));
+            this._on($('nfpAbB'), 'click', () => this._setAb('b'));
+            this._on($('nfpAbC'), 'click', () => this._setAb('clear'));
+            this._on($('nfpPinSave'), 'click', () => this._saveSeriesProfile());
+            this._on($('nfpPinDel'), 'click', () => this._clearSeriesProfile());
+
+            // buttons
+            this._on($('nfpFs'), 'click', () => this._fs());
+            this._on($('nfpMt'), 'click', () => this._mute());
+            this._on($('nfpPip'), 'click', () => this._miniPlayer());
+            this._on($('nfpShot'), 'click', () => this._screenshot());
+            this._on($('nfpTStats'), 'click', () => this._nfHotkey('D'));
+            this._on($('nfpTSel'), 'click', () => this._nfHotkey('S'));
+            this._on($('nfpMaxBr'), 'change', e => {
+                S.set('maxBitrate', e.target.checked);
+                if (e.target.checked) {
+                    const kbps = NFPlayer.lockMaxBitrate();
+                    this.toast(kbps ? `🎯 Max offered bitrate (${kbps} kbps)` : 'ℹ️ Armed (player hides manual bitrate API on this build)', 'br');
+                } else {
+                    this.toast('🎯 Auto bitrate restored on next reload', 'br');
+                }
+            });
+            this._on($('nfpAudTrk'), 'change', e => {
+                const t = NFPlayer.audioTracks()[parseInt(e.target.value, 10)];
+                if (t && NFPlayer.setAudio(t)) this.toast(`🔊 Audio: ${t.displayName || t.language || 'switched'}`, 'trk');
+            });
+            this._on($('nfpTxtTrk'), 'change', e => {
+                const t = NFPlayer.textTracks()[parseInt(e.target.value, 10)];
+                if (t && NFPlayer.setText(t)) this.toast(`💬 Subtitles: ${t.displayName || t.language || 'switched'}`, 'trk');
+            });
+
+            // audio
+            this._on($('nfpBoost'), 'input', e => this._setAudio(parseInt(e.target.value, 10), S.get('audioMode')));
+            this._on($('nfpAudM'), 'change', e => {
+                const m = e.target.value;
+                this._setAudio(S.get('boost'), m);
+                const label = e.target.options[e.target.selectedIndex]?.text || m;
+                this.toast(`🔊 Audio: ${label}`, 'audio');
+            });
+
+            // picture filters
+            this._filterRows().forEach(({ sl, key }) => {
+                this._on($(sl), 'input', e => this._setFilters({ [key]: parseInt(e.target.value, 10) }));
+            });
+            this._on($('nfpPre'), 'change', e => {
+                const p = this.presets[e.target.value];
+                if (p) this._setFilters(p);
+            });
+            this._on($('nfpRF'), 'click', () => this._setFilters(this.presets.Default));
+
+            // subtitles
+            this._on($('nfpSubS'), 'input', e => this._setSubs({ size: parseInt(e.target.value, 10) }));
+            this._on($('nfpSubL'), 'input', e => this._setSubs({ lift: parseInt(e.target.value, 10) }));
+            this._on($('nfpSubBg'), 'change', e => this._setSubs({ bg: e.target.checked }));
+            this._on($('nfpSubHid'), 'change', e => this._setSubs({ hidden: e.target.checked }));
+            this._on($('nfpSubAutoCp'), 'change', e => {
+                S.set('subCopy', e.target.checked);
+                this.toast(e.target.checked ? '📋 Auto-copy subtitles on' : '📋 Auto-copy subtitles off', 'subs');
+            });
+            this._on($('nfpSubRep'), 'click', () => this._replaySub());
+            this._on($('nfpSubCp'), 'click', () => this._copySub());
+            this._on($('nfpSubLog'), 'click', e => {
+                const btn = e.target.closest('[data-subidx]');
+                if (!btn) return;
+                const item = this.subTracker.lines[parseInt(btn.dataset.subidx, 10)];
+                if (item) { NFPlayer.seekTo(item.t); this.toast(`⏪ Jumped to ${fmtClock(item.t)}`, 'subs'); }
+            });
+            this._on($('nfpRS'), 'click', () => this._setSubs(clone(DEFAULTS.subs)));
+
+            // secret genres
+            const openGenre = id => {
+                const clean = String(id || '').replace(/\D+/g, '');
+                if (!clean) { this.toast('⚠️ Enter a numeric genre ID', 'genre'); return; }
+                location.href = `https://www.netflix.com/browse/genre/${clean}`;
+            };
+            this.panel.querySelectorAll('[data-genre]').forEach(b =>
+                this._on(b, 'click', () => openGenre(b.dataset.genre)));
+            this._on($('nfpGenGo'), 'click', () => openGenre($('nfpGenIn')?.value));
+            this._on($('nfpGenIn'), 'keydown', e => { if (e.key === 'Enter') openGenre(e.target.value); });
+
+            // automation
+            [
+                ['nfpAI', 'autoIntro', 'Skip intro & recap'],
+                ['nfpAN', 'autoNext', 'Auto next episode'],
+                ['nfpAWC', 'autoCredits', 'Auto-expand credits'],
+                ['nfpAC', 'autoContinue', 'Auto "still watching?"'],
+                ['nfpMR', 'modalRatings', 'Title popup ratings'],
+                ['nfpAS', 'antiSpoiler', 'Anti-spoiler blur'],
+                ['nfpMB', 'muteBrowse', 'Mute browse previews'],
+                ['nfpBL', 'browseLauncher', 'Browse page launcher'],
+                ['nfpSS', 'sideSeek', 'Side-zone seek']
+            ].forEach(([id, key, label]) => {
+                this._on($(id), 'change', e => {
+                    S.set(key, e.target.checked);
+                    if (key === 'muteBrowse') this._enforceBrowseMute();
+                    if (key === 'antiSpoiler') this._applySpoilerCss();
+                    if (key === 'browseLauncher') this._syncVisibility();
+                    this.toast(`${e.target.checked ? '✅' : '⛔'} ${label} ${e.target.checked ? 'on' : 'off'}`, 'auto-' + key);
+                    this._tick();
+                });
+            });
+
+            // sleep timer
+            this._on($('nfpSleep'), 'change', e => this._setSleep(e.target.value));
+
+            // stats reset
+            this._on($('nfpHR'), 'click', () => {
+                if (!window.confirm('Reset all watch-time statistics?')) return;
+                this.watch.reset();
+                S.set('skipStats', { count: 0, sec: 0 });
+                this._tick();
+            });
+
+            // collapsible sections remember their state
+            this._on(this.panel, 'toggle', e => {
+                if (this._syncing || !e.target.dataset || !e.target.dataset.sec) return;
+                S.set('sections', Object.assign({}, S.get('sections'), { [e.target.dataset.sec]: e.target.open }));
+            }, true);
+
+            this._on($('nfpReset'), 'click', () => this._resetAll());
+        }
+
+        _syncAllUI() {
+            this._syncing = true;
+            const secs = S.get('sections');
+            this.panel.querySelectorAll('details[data-sec]').forEach(d => {
+                const id = d.dataset.sec;
+                d.open = id in secs ? !!secs[id] : !!DEFAULT_OPEN[id];
+            });
+            this._syncing = false;
+
+            const min = !!S.get('minimized');
+            this.panel.classList.toggle('min', min);
+            this.$('nfpMin').textContent = min ? '□' : '−';
+
+            this._syncCinemaUI();
+            this._syncSpeedUI();
+            this._syncZoomUI();
+            this._syncAbUI();
+            this._syncAudioUI();
+            this._syncFilterUI();
+            this._syncSubsUI();
+            this._syncSleepUI();
+            [
+                ['nfpAI', 'autoIntro'], ['nfpAN', 'autoNext'], ['nfpAWC', 'autoCredits'],
+                ['nfpAC', 'autoContinue'], ['nfpMR', 'modalRatings'], ['nfpAS', 'antiSpoiler'],
+                ['nfpMB', 'muteBrowse'], ['nfpBL', 'browseLauncher'], ['nfpSS', 'sideSeek'],
+                ['nfpSubAutoCp', 'subCopy'], ['nfpMaxBr', 'maxBitrate']
+            ].forEach(([id, key]) => { const el = this.$(id); if (el) el.checked = !!S.get(key); });
+        }
+
+        _resetAll() {
+            if (!window.confirm('Reset every Netflix Helper Pro+ setting to its default?')) return;
+            [
+                'cinemaMode', 'cinemaLights', 'cinemaAmbi', 'cinemaSubs', 'cinemaSound',
+                'speed', 'zoom', 'filters', 'subs', 'audioMode', 'boost', 'autoIntro', 'autoNext',
+                'autoCredits', 'autoContinue', 'muteBrowse', 'antiSpoiler', 'modalRatings',
+                'browseLauncher', 'subCopy', 'maxBitrate', 'sideSeek', 'minimized', 'sections', 'pos'
+            ].forEach(k => S.set(k, clone(DEFAULTS[k])));
+            this.filters = clone(DEFAULTS.filters);
+            this.subs = clone(DEFAULTS.subs);
+            this.ab = { a: null, b: null };
+            this.sleep.set('0');
+            this.panel.style.left = ''; this.panel.style.top = ''; this.panel.style.right = '';
+            this._applySubsCss();
+            this._applySpoilerCss();
+            this._syncAllUI();
+            const v = DOM.video();
+            if (v) { this._applyCinema(v); this._applyFilters(v); this._applyZoom(v); this._applySpeed(v); this.audio.apply(100, 'off', v); }
+            this.toast('♻️ Settings reset', 'reset');
+        }
+
+        /* ───────── keyboard ───────── */
+        _keys() {
+            const editable = t => !!t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName));
+            const SLEEP = ['0', '15', '30', '45', '60', '90', 'end'];
+            const ZOOMS = [100, 113, 134];
+
+            this._on(document, 'keydown', e => {
+                if (e.isComposing || editable(e.target)) return;
+                if (e.ctrlKey || e.metaKey || e.altKey) return;
+                const k = e.key, code = e.code;
+
+                if (k === 'F2') {
+                    e.preventDefault();
+                    if (!e.repeat) this.toggle();
+                    return;
+                }
+                if (e.target.closest && e.target.closest('.nfp')) return;
+                if (!isWatchPage()) return;
+
+                let used = true;
+                if (!e.shiftKey && (k === 'g' || k === 'G')) { if (!e.repeat) this.toggleCinema(); }
+                else if (!e.shiftKey && (k === 'r' || k === 'R')) { if (!e.repeat) this._replaySub(); }
+                else if (e.shiftKey && (k === 'x' || k === 'X')) { if (!e.repeat) this._copySub(); }
+                else if (!e.shiftKey && k === '[') this.toast('⏪ ' + this._setSpeed(S.get('speed') - 0.1).toFixed(2) + 'x', 'speed');
+                else if (!e.shiftKey && k === ']') this.toast('⏩ ' + this._setSpeed(S.get('speed') + 0.1).toFixed(2) + 'x', 'speed');
+                else if (!e.shiftKey && k === '\\') { this._setSpeed(1); this.toast('1.00x', 'speed'); }
+                else if (e.shiftKey && code === 'BracketLeft') { if (!e.repeat) this._setAb('a'); }
+                else if (e.shiftKey && code === 'BracketRight') { if (!e.repeat) this._setAb('b'); }
+                else if (e.shiftKey && code === 'Backslash') { if (!e.repeat) this._setAb('clear'); }
+                else if (!e.shiftKey && (k === 'p' || k === 'P')) { if (!e.repeat) this._miniPlayer(); }
+                else if (!e.shiftKey && (k === 'z' || k === 'Z')) {
+                    if (!e.repeat) {
+                        const cur = S.get('zoom');
+                        const next = ZOOMS[(ZOOMS.indexOf(cur) + 1) % ZOOMS.length];
+                        this._setZoom(next);
+                        this.toast(`🔍 Zoom: ${next === 100 ? 'Fit (100%)' : next + '%'}`, 'zoom');
+                    }
+                }
+                else if (e.shiftKey && k === 'ArrowRight') this._seek(CFG.bigSeek);
+                else if (e.shiftKey && k === 'ArrowLeft') this._seek(-CFG.bigSeek);
+                else if (e.shiftKey && k === 'ArrowUp') this._setAudio(S.get('boost') + 10, S.get('audioMode')).then(p => this.toast(`🔊 Boost ${p}%`, 'boost'));
+                else if (e.shiftKey && k === 'ArrowDown') this._setAudio(S.get('boost') - 10, S.get('audioMode')).then(p => this.toast(`🔊 Boost ${p}%`, 'boost'));
+                else if (e.shiftKey && (k === 'c' || k === 'C')) {
+                    if (!e.repeat) {
+                        const hid = !this.subs.hidden;
+                        this._setSubs({ hidden: hid });
+                        this.toast(hid ? '💬 Subtitles hidden' : '💬 Subtitles visible', 'subs');
+                    }
+                }
+                else if (e.shiftKey && (k === 's' || k === 'S')) { if (!e.repeat) this._screenshot(); }
+                else if (e.shiftKey && (k === 't' || k === 'T')) {
+                    if (!e.repeat) {
+                        const cur = this.sleep.mode ? this.sleep.choice : '0';
+                        this._setSleep(SLEEP[(SLEEP.indexOf(cur) + 1) % SLEEP.length]);
+                    }
+                }
+                else used = false;
+
+                if (used) { e.preventDefault(); e.stopImmediatePropagation(); }
+            }, true);
+        }
+
+        _gestures() {
+            this._on(document, 'dblclick', e => {
+                if (!S.get('sideSeek') || !isWatchPage()) return;
+                const v = DOM.video();
+                if (!v) return;
+                if (e.target.closest && e.target.closest('.nfp, button, a, input, select, [role="slider"]')) return;
+                const r = v.getBoundingClientRect();
+                if (e.clientX < r.left || e.clientX > r.right) return;
+                if (e.clientY < r.top + r.height * 0.12 || e.clientY > r.bottom - r.height * 0.22) return;
+                const x = (e.clientX - r.left) / r.width;
+                if (x < 0.3) this._seek(-CFG.seekStep);
+                else if (x > 0.7) this._seek(CFG.seekStep);
+                else return;
+                e.preventDefault();
+                e.stopImmediatePropagation();
+            }, true);
+        }
+
+        /* ───────── video / episode lifecycle ───────── */
+        _applyAll(v) {
+            v = v || DOM.video();
+            if (!v) return;
+            if (!isWatchPage()) { this._enforceBrowseMute(); return; }
+            this._applyFilters(v);
+            this._applyZoom(v);
+            this._applySpeed(v);
+            this._applyCinema(v);
+            this._applyMaxBitrate();
+        }
+
+        _onSource(v) {
+            this.net.reset();
+            NFPlayer.reset();
+            this._seeking = false;
+            setTimeout(() => { if (!this._dead) this._applyAll(v); }, 600);
+        }
+
+        _onEpisodeChange(id) {
+            log('Episode change:', id || '(none)');
+            this._epId = id;
+            this._loadedSeries = '';
+            this.ab = { a: null, b: null };
+            this._syncAbUI();
+            this.subTracker.reset();
+            this.net.reset();
+            this.skip.newEpisode();
+            NFPlayer.reset();
+            this._seeking = false;
+        }
+
+        _watchVideo() {
+            this._iv(() => {
+                const v = DOM.video();
+                if (v === this._video) return;
+                this._clearV();
+                this._video = v || null;
+                if (!v) { this.fps.stop(); this.ambi.stop(); return; }
+
+                this._onV(v, 'loadstart', () => this._onSource(v));
+                this._onV(v, 'loadedmetadata', () => this._applyAll(v));
+                this._onV(v, 'playing', () => { this._seeking = false; this._syncHouseLights(v); this._applyAll(v); });
+                this._onV(v, 'play', () => this._syncHouseLights(v));
+                this._onV(v, 'pause', () => this._syncHouseLights(v));
+                this._onV(v, 'seeked', () => this._applySpeed(v));
+                this._onV(v, 'error', () => { this._seeking = false; this.skip.suspend(CFG.errorRecovery); });
+                this._bindPip(v);
+
+                this._applyAll(v);
+                if (isWatchPage()) {
+                    this._reattachPip(v);
+                    if (this._first) { this._first = false; this.toast(`Netflix Helper Pro+ v${VERSION} ✓`, 'hello'); }
+                }
+            }, 700);
+        }
+
+        _watchPage() {
+            let lastHref = '';
+            this._iv(() => {
+                if (location.href !== lastHref) {
+                    lastHref = location.href;
+                    const id = videoIdFromUrl();
+                    if (id !== this._epId) this._onEpisodeChange(id);
+                    this._syncVisibility();
+                }
+            }, 500);
+        }
+
+        /* ───────── boot ───────── */
+        init() {
+            this._css();
+            this._applySubsCss();
+            this._applySpoilerCss();
+            this._html();
+
+            const pos = S.get('pos');
+            if (pos) {
+                this.panel.style.left = parseFloat(pos.l) + 'px';
+                this.panel.style.top = parseFloat(pos.t) + 'px';
+                this.panel.style.right = 'auto';
+            }
+
+            this._drag();
+            this._controls();
+            this._keys();
+            this._gestures();
+            this._wireBrowseMute();
+            this._syncAllUI();
+            this._syncVisibility();
+            this._enforceBrowseMute();
+
+            this._on(document, 'fullscreenchange', () => { this._mount(); this._clampToViewport(); });
+            this._on(document, 'webkitfullscreenchange', () => { this._mount(); this._clampToViewport(); });
+            this._on(window, 'pagehide', () => this.watch.flush());
+            this._on(document, 'visibilitychange', () => { if (document.hidden) this.watch.flush(); });
+
+            this._watchVideo();
+            this._watchPage();
+            this._iv(() => this._tick(), CFG.tick);
+            this.skip.start();
+            this.subTracker.start();
+
+            if (typeof GM_registerMenuCommand === 'function') {
+                try {
+                    this._menuIds.push(GM_registerMenuCommand('Toggle Netflix Helper Pro+ panel', () => this.toggle()));
+                } catch { /* ignore */ }
+            }
+            log(`v${VERSION} ready`);
+        }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       BOOT
+    ───────────────────────────────────────────────────────────── */
+    function boot() {
+        if (!document.head || !document.body) {
+            requestAnimationFrame(boot);
+            return;
+        }
+        try { if (win._nfp) win._nfp.destroy(); } catch { /* ignore */ }
+        document.querySelectorAll('.nfp, .nfp-launch, .nfp-toasts, .nfp-lights, .nfp-ambi, .nfp-ratebar, #nfp-svg, #nfp-style, #nfp-subs-style, #nfp-spoiler-style').forEach(el => el.remove());
+
+        const ui = new UI();
+        win._nfp = ui;
+        try { ui.init(); } catch (err) { console.error('[NF+] init failed:', err); }
+    }
+
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
+    else boot();
+
+    window.addEventListener('beforeunload', () => { try { if (win._nfp) win._nfp.destroy(); } catch { /* ignore */ } });
+})();
